@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "pft-chatbot": {
+      "command": "npx",
+      "args": ["-y", "@postfiatorg/pft-chatbot-mcp"],
+      "env": {
+        "BOT_SEED_FILE": "/absolute/path/to/your/bot-seed-file"
+      }
+    }
+  }
+}

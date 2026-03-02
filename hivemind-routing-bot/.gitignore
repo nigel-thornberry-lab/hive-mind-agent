@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+# Seed files: NEVER commit. Stored outside repo (e.g. ~/.hivemind-bot-seed) or use *.seed.
+*.seed
+.hivemind-bot-seed
+.keystone-api-key
+.DS_Store
+*.log
+npm-debug.log*
+.cursor/
+.bot-cursor
+.hivemind-bot-loop.lock

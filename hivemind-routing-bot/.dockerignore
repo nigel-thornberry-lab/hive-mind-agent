@@ -1,0 +1,15 @@
+node_modules
+dist
+.git
+*.seed
+.keystone-api-key
+.env
+.env.*
+*.log
+.cursor
+.bot-cursor
+test
+scripts
+docs
+README.md
+*.md
