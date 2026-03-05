@@ -16,7 +16,7 @@ const MCP_SCRIPT = "dist/src/mcp-server-with-routing.js";
 const REGISTER_PARAMS = {
   name: "Hive Mind Routing",
   description:
-    "Tell me what you need in plain English and I return the top 3 members most likely to deliver. I rank by skill fit, shipping history, and trust signals, then reply with wallet addresses, confidence scores, and why each match fits.",
+    "Need something done fast? Leverage the Post Fiat Hive Mind. Tell me what you need, and I'll return the top 3 members most likely to deliver - with confidence, trust context, and why they fit.",
   capabilities: ["routing", "member-matching", "text-generation"],
   commands: [
     {
