@@ -162,13 +162,20 @@ export function computeBriefConfidence(brief: MatchBrief): number {
   const budget = brief.budget_pft != null || brief.budget_band !== "unknown" ? 1 : 0;
   const constraints = brief.timezone_pref || brief.min_trust_score != null ? 1 : 0;
 
-  const score =
+  const fieldScore =
     INTAKE_IMPACT_WEIGHTS.objective_or_deliverable * objective +
     INTAKE_IMPACT_WEIGHTS.must_have_skills * mustHave +
     INTAKE_IMPACT_WEIGHTS.timeline_or_urgency * timeline +
     INTAKE_IMPACT_WEIGHTS.budget * budget +
     INTAKE_IMPACT_WEIGHTS.constraints * constraints;
-  return Number(score.toFixed(4));
+
+  // User answers provide context even when keyword detectors can't extract
+  // structured fields — the raw text still feeds into the ranking prompt.
+  // Credit up to 0.15 for answered questions (0.1 per answer, capped).
+  const answeredCount = Math.max(0, brief.user_messages.length - 1);
+  const interactionBonus = Math.min(0.15, answeredCount * 0.1);
+
+  return Number(Math.min(1, fieldScore + interactionBonus).toFixed(4));
 }
 
 export function computeAmbiguityScore(brief: MatchBrief): number {

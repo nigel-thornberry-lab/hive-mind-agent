@@ -23,6 +23,21 @@ import { defaultLogger, generateRequestId } from "./logger.js";
 
 const PFT_CHATBOT_MCP_PATH = resolve(process.cwd(), "node_modules/@postfiatorg/pft-chatbot-mcp/dist/index.js");
 
+function parseJwtExpiry(jwt: string | null): number | null {
+  if (!jwt) return null;
+  try {
+    const parts = jwt.split(".");
+    if (parts.length !== 3) return null;
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
+    return typeof payload.exp === "number" ? payload.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+const JWT_WARN_THRESHOLD_MS = 60 * 60 * 1000;
+const JWT_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
 const MAX_SEEN_TX_HASHES = 5000;
@@ -277,17 +292,17 @@ function formatClarifier(prompt: string): string {
     "Quick question before ranking:",
     prompt,
     "",
-    "Reply in one message, or say: run now",
+    "Reply with /match followed by your answer, or /match run now to skip.",
   ].join("\n");
 }
 
 function formatPendingQuestionReminder(prompt: string): string {
   return [
-    "Please answer the current question before starting a new /match request.",
+    "Still waiting on your answer:",
     "",
-    `Pending question: ${prompt}`,
+    prompt,
     "",
-    "Reply in one message, or say: run now",
+    "Reply with /match followed by your answer, or /match run now to skip.",
   ].join("\n");
 }
 
@@ -355,7 +370,38 @@ async function main(): Promise<void> {
   const seenTxHashes = new Set<string>();
   const seenQueue: string[] = [];
   const briefStore = new InMemoryBriefStore();
-  cache.getSnapshot({ forceRefresh: false }).then(() => { ready = true; }).catch(() => {});
+
+  // Proactive cache warmup — block until first load completes so the first
+  // real user request never pays cold-start latency.
+  log.info("Warming member-index cache…");
+  try {
+    const warmT0 = Date.now();
+    await cache.getSnapshot({ forceRefresh: true });
+    log.info(`Cache warmed in ${Date.now() - warmT0}ms (${cache.stats.operator_count} operators).`);
+  } catch (err) {
+    log.error(`Cache warmup failed: ${(err as Error).message}`, "cache_warmup");
+  }
+  ready = true;
+
+  // Periodic background refresh keeps the cache hot between user requests.
+  const CACHE_REFRESH_INTERVAL_MS = Math.max(config.memberIndexTtlMs, 60_000);
+  const cacheRefreshId = setInterval(() => {
+    cache.getSnapshot({ forceRefresh: false }).catch((err) => {
+      log.error(`Periodic cache refresh failed: ${(err as Error).message}`, "cache_refresh");
+    });
+  }, CACHE_REFRESH_INTERVAL_MS);
+
+  // JWT health monitoring
+  const jwtExpiresAt = parseJwtExpiry(config.taskNodeJwt ?? null);
+  const jwtCheckId = setInterval(() => {
+    if (!jwtExpiresAt) return;
+    const remaining = jwtExpiresAt - Date.now();
+    if (remaining <= 0) {
+      log.error("JWT has EXPIRED. Matching requests will fail until a fresh token is set.", "jwt_expiry");
+    } else if (remaining < JWT_WARN_THRESHOLD_MS) {
+      log.warn(`JWT expires in ${Math.round(remaining / 60_000)} minutes. Refresh soon.`);
+    }
+  }, JWT_CHECK_INTERVAL_MS);
 
   const markSeen = (txHash: string): void => {
     if (seenTxHashes.has(txHash)) return;
@@ -365,6 +411,17 @@ async function main(): Promise<void> {
       const oldest = seenQueue.shift();
       if (oldest) seenTxHashes.delete(oldest);
     }
+  };
+
+  const SENDER_COOLDOWN_MS = 5000;
+  const lastReplyBySender = new Map<string, number>();
+  const isInCooldown = (sender: string): boolean => {
+    const last = lastReplyBySender.get(sender);
+    if (!last) return false;
+    return Date.now() - last < SENDER_COOLDOWN_MS;
+  };
+  const markReplied = (sender: string): void => {
+    lastReplyBySender.set(sender, Date.now());
   };
 
   const tick = async (): Promise<void> => {
@@ -399,6 +456,11 @@ async function main(): Promise<void> {
             markSeen(msg.tx_hash);
             continue;
           }
+          if (isInCooldown(msg.sender)) {
+            log.info(`Skipping duplicate from ${msg.sender} (cooldown)`);
+            markSeen(msg.tx_hash);
+            continue;
+          }
           if (request.action === "help") {
             await withRetry(() =>
               mcp.callTool("send_message", {
@@ -408,8 +470,17 @@ async function main(): Promise<void> {
               })
             );
             markSeen(msg.tx_hash);
+            markReplied(msg.sender);
             continue;
           }
+
+          // When user has an active clarifying brief, treat `/match <answer>` as a followup
+          // answer rather than a new request. The Task Node UI requires the /match prefix
+          // on all messages to bots, so this is the only way users can reply.
+          const isClarifyingFollowup =
+            request.action === "match" &&
+            existingBrief?.stage === "clarifying" &&
+            request.request_text.trim().length > 0;
 
           if (
             request.action === "match" &&
@@ -427,6 +498,7 @@ async function main(): Promise<void> {
               })
             );
             markSeen(msg.tx_hash);
+            markReplied(msg.sender);
             continue;
           }
 
@@ -434,14 +506,16 @@ async function main(): Promise<void> {
             request.action === "match"
               ? request.request_text
               : request.text;
-          const isFollowup = request.action === "followup";
+          const isFollowup = request.action === "followup" || isClarifyingFollowup;
           const isRunNow = isFollowup && /\brun now\b/i.test(userText);
           const briefForThisTurn =
-            request.action === "match"
-              ? null
-              : existingBrief;
+            isClarifyingFollowup
+              ? existingBrief
+              : request.action === "match"
+                ? null
+                : existingBrief;
 
-          if (request.action === "match") {
+          if (request.action === "match" && !isClarifyingFollowup) {
             briefStore.recordBriefStarted();
           }
           if (isFollowup && existingBrief?.stage === "clarifying") {
@@ -486,6 +560,7 @@ async function main(): Promise<void> {
               })
             );
             markSeen(msg.tx_hash);
+            markReplied(msg.sender);
             continue;
           }
 
@@ -506,6 +581,7 @@ async function main(): Promise<void> {
               })
             );
             markSeen(msg.tx_hash);
+            markReplied(msg.sender);
             continue;
           }
 
@@ -573,6 +649,7 @@ async function main(): Promise<void> {
           const finalized = finalizeRankedBrief(action.brief, rankedCandidates, action.provisional);
           briefStore.set(msg.sender, finalized);
           markSeen(msg.tx_hash);
+          markReplied(msg.sender);
           log.briefLifecycle("brief_ranked", {
             request_id: requestId,
             sender: msg.sender,
@@ -617,8 +694,18 @@ async function main(): Promise<void> {
         return;
       }
       if (url === "/stats") {
+        const now = Date.now();
+        const jwtStatus = !jwtExpiresAt
+          ? { status: "unknown" as const, expires_at: null, expires_in_ms: null }
+          : jwtExpiresAt <= now
+            ? { status: "expired" as const, expires_at: new Date(jwtExpiresAt).toISOString(), expires_in_ms: jwtExpiresAt - now }
+            : jwtExpiresAt - now < JWT_WARN_THRESHOLD_MS
+              ? { status: "expiring_soon" as const, expires_at: new Date(jwtExpiresAt).toISOString(), expires_in_ms: jwtExpiresAt - now }
+              : { status: "ok" as const, expires_at: new Date(jwtExpiresAt).toISOString(), expires_in_ms: jwtExpiresAt - now };
+
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
+          jwt: jwtStatus,
           cache: cache.stats,
           funnel: briefStore.funnel,
           active_briefs: briefStore.size,
@@ -643,6 +730,8 @@ async function main(): Promise<void> {
   const shutdown = (): void => {
     clearInterval(intervalId);
     clearInterval(sweepIntervalId);
+    clearInterval(cacheRefreshId);
+    clearInterval(jwtCheckId);
     mcp.disconnect();
     try {
       unlinkSync(lockFilePath);
