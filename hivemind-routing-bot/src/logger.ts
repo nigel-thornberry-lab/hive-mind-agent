@@ -27,6 +27,9 @@ export interface MatchResultEvent extends BaseEvent {
   provisional: boolean;
   latency_ms: number;
   cache_status: "hit" | "miss" | "stale";
+  request_text_length?: number;
+  tag_count?: number;
+  user_message_count?: number;
 }
 
 export interface ClarificationEvent extends BaseEvent {
@@ -58,13 +61,30 @@ export interface ErrorLogEvent extends BaseEvent {
   context?: string;
 }
 
+export interface CursorCommitEvent extends BaseEvent {
+  event: "cursor_commit";
+  success: boolean;
+  cursor?: number;
+  error?: string;
+}
+
+export interface MatchOutcomeEvent extends BaseEvent {
+  event: "match_outcome";
+  sender: string;
+  outcome: "selection" | "rerun" | "followup" | "unknown";
+  /** 1-based match index when outcome is selection */
+  selection?: number;
+}
+
 export type LogEvent =
   | MatchRequestEvent
   | MatchResultEvent
   | ClarificationEvent
   | CacheEvent
   | BriefLifecycleEvent
-  | ErrorLogEvent;
+  | ErrorLogEvent
+  | CursorCommitEvent
+  | MatchOutcomeEvent;
 
 const LOG_LEVELS: Record<LogLevel, number> = {
   debug: 0,
@@ -129,6 +149,28 @@ export class Logger {
 
   error(error: string, context?: string, request_id?: string): void {
     this.emit({ ts: now(), level: "error", event: "bot_error", error, context, request_id });
+  }
+
+  cursorCommit(success: boolean, cursor?: number, error?: string): void {
+    const level: LogLevel = success ? "debug" : "warn";
+    this.emit({ ts: now(), level, event: "cursor_commit", success, cursor, error });
+  }
+
+  matchOutcome(
+    sender: string,
+    outcome: MatchOutcomeEvent["outcome"],
+    requestId?: string,
+    selection?: number
+  ): void {
+    this.emit({
+      ts: now(),
+      level: "info",
+      event: "match_outcome",
+      sender,
+      outcome,
+      request_id: requestId,
+      selection,
+    });
   }
 
   info(message: string): void {

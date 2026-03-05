@@ -29,6 +29,7 @@ function minimalConfig(overrides: Partial<BotConfig> = {}): BotConfig {
     memberIndexLimit: 10,
     scanIntervalMs: 5000,
     cursorFilePath: null,
+    persistStorePath: null,
     healthPort: 0,
     ...overrides,
   };

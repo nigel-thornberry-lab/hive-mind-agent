@@ -24,6 +24,8 @@ export interface BotConfig {
   scanIntervalMs: number;
   /** Optional path to persist idempotency cursor (since_ledger). */
   cursorFilePath: string | null;
+  /** Optional directory for persistent brief + seen-hash store (enables persistence when set). */
+  persistStorePath: string | null;
   /** Optional health server port (0 = disabled). */
   healthPort: number;
 }
@@ -74,6 +76,7 @@ export function loadConfig(): BotConfig {
     memberIndexLimit: Math.max(1, Math.min(200, envNumber("PFT_MEMBER_INDEX_LIMIT", 40))),
     scanIntervalMs: Math.max(5_000, envNumber("PFT_SCAN_INTERVAL_MS", 30_000)),
     cursorFilePath: env("PFT_BOT_CURSOR_FILE")?.trim() || null,
+    persistStorePath: env("PFT_BOT_PERSIST_STORE_PATH")?.trim() || null,
     healthPort: Math.max(0, envNumber("PFT_BOT_HEALTH_PORT", 0)),
   };
 }

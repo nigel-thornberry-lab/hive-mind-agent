@@ -10,7 +10,7 @@ import {
   type MatchBrief,
   type RankedCandidate,
 } from "./match-brief.js";
-import { chooseNextQuestion } from "./question-policy.js";
+import { chooseNextQuestion, buildConfirmationQuestion, getFallbackQuestionForAmbiguous } from "./question-policy.js";
 
 export type ConversationAction =
   | { type: "ask"; question_id: string; prompt: string; brief: MatchBrief }
@@ -48,9 +48,28 @@ export function startOrContinueMatchBrief(input: StateMachineInput): Conversatio
   }
 
   brief = recomputeDerived(brief);
-  // Require at least one clarifying question unless user explicitly forces ranking.
+
+  // First turn: skip questions when confidence is already at ranking threshold.
   if (!forceRun && brief.questions_asked === 0) {
-    const q0 = chooseNextQuestion(brief);
+    if (brief.brief_confidence >= 0.75) {
+      return { type: "rank", provisional: false, brief: markReady(brief) };
+    }
+    // If the user already provided strong detail (objective + skills or timeline),
+    // ask a soft confirmation instead of a field-interrogation question.
+    if (brief.brief_confidence >= 0.55) {
+      const confirm = buildConfirmationQuestion(brief);
+      const asked0 = markQuestionAsked(brief, confirm.id);
+      return {
+        type: "ask",
+        question_id: confirm.id,
+        prompt: confirm.prompt,
+        brief: asked0,
+      };
+    }
+    let q0 = chooseNextQuestion(brief);
+    if (!q0 && brief.ambiguity_score >= 0.5 && brief.brief_confidence < 0.55) {
+      q0 = getFallbackQuestionForAmbiguous(brief);
+    }
     if (q0) {
       const asked0 = markQuestionAsked(brief, q0.id);
       return {
@@ -61,6 +80,7 @@ export function startOrContinueMatchBrief(input: StateMachineInput): Conversatio
       };
     }
   }
+
   if (shouldStopClarifying(brief, forceRun)) {
     return { type: "rank", provisional: brief.brief_confidence < 0.75, brief: markReady(brief) };
   }

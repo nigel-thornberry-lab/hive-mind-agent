@@ -62,6 +62,13 @@ describe("normalizeMemberMatchPayload", () => {
     const out = normalizeMemberMatchPayload({ request_text: "x", top_k: 10 });
     assert.strictEqual(out.top_k, 3);
   });
+
+  it("normalizes urgency and defaults to unknown", () => {
+    const out = normalizeMemberMatchPayload({ request_text: "x", urgency: "this_week" });
+    assert.strictEqual(out.urgency, "this_week");
+    const out2 = normalizeMemberMatchPayload({ request_text: "x" });
+    assert.strictEqual(out2.urgency, "unknown");
+  });
 });
 
 describe("getSybilPenaltyMultiplier", () => {
@@ -259,6 +266,74 @@ describe("runMemberMatchWithDataset", () => {
       "7f129508-935a-42e2-95d0-85907c552c6c",
       "Yuri should be the top match for React auth race conditions"
     );
+  });
+
+  it("reverse alias: monitoring request matches observability operator", () => {
+    const observabilityOp = mockOperator({
+      operator_id: "obs-1",
+      wallet_address: "rObs",
+      summary: "Observability and SRE",
+      expert_knowledge: [{ domain: "observability", confidence: null }, { domain: "prometheus", confidence: null }],
+    });
+    const other = mockOperator({
+      operator_id: "other",
+      wallet_address: "rOther",
+      expert_knowledge: [{ domain: "backend", confidence: null }],
+    });
+    const snapshot = mockSnapshot([other, observabilityOp]);
+    const result = runMemberMatchWithDataset(
+      { request_text: "Need monitoring and telemetry for our services" },
+      snapshot
+    );
+    assert.strictEqual(result.ok, true);
+    assert.ok(result.top_matches.length >= 1);
+    assert.strictEqual(result.top_matches[0].operator_id, "obs-1");
+  });
+
+  it("short token ai is kept and matches AI operator", () => {
+    const aiOp = mockOperator({
+      operator_id: "ai-1",
+      wallet_address: "rAI",
+      expert_knowledge: [{ domain: "ai", confidence: null }, { domain: "machine learning", confidence: null }],
+    });
+    const other = mockOperator({
+      operator_id: "other",
+      wallet_address: "rOther",
+      expert_knowledge: [{ domain: "backend", confidence: null }],
+    });
+    const snapshot = mockSnapshot([other, aiOp]);
+    const result = runMemberMatchWithDataset(
+      { request_text: "Need ai and ml for a chatbot" },
+      snapshot
+    );
+    assert.strictEqual(result.ok, true);
+    assert.ok(result.top_matches.length >= 1);
+    assert.strictEqual(result.top_matches[0].operator_id, "ai-1");
+  });
+
+  it("urgency today boosts more active operator when skills similar", () => {
+    const active = mockOperator({
+      operator_id: "active",
+      wallet_address: "rActive",
+      expert_knowledge: [{ domain: "typescript", confidence: null }],
+      weekly_tasks: 15,
+      monthly_tasks: 60,
+    });
+    const quiet = mockOperator({
+      operator_id: "quiet",
+      wallet_address: "rQuiet",
+      expert_knowledge: [{ domain: "typescript", confidence: null }],
+      weekly_tasks: 0,
+      monthly_tasks: 2,
+    });
+    const snapshot = mockSnapshot([quiet, active]);
+    const result = runMemberMatchWithDataset(
+      { request_text: "TypeScript help", tags: ["typescript"], urgency: "today" },
+      snapshot
+    );
+    assert.strictEqual(result.ok, true);
+    assert.ok(result.top_matches.length >= 1);
+    assert.strictEqual(result.top_matches[0].operator_id, "active");
   });
 
   it("matches live sample data: Discord bot + LLM -> Discord bot developer", () => {

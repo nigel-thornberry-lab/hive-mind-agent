@@ -36,6 +36,8 @@ const STOPWORDS = new Set([
   "or", "at", "is", "are", "be", "as", "using", "use", "build", "create", "design", "implement",
 ]);
 
+const CRITICAL_2CHAR = new Set(["ai", "ui", "ux"]);
+
 const EMBEDDING_DIMS = 256;
 const MIN_RETRIEVAL_SCORE = 0.15;
 const MIN_FINAL_SCORE = 0.18;
@@ -82,6 +84,17 @@ const SEMANTIC_ALIASES: Record<string, string[]> = {
   ai: ["machine", "learning", "neural", "model", "training", "inference"],
 };
 
+const REVERSE_ALIASES: Record<string, string[]> = (() => {
+  const rev: Record<string, string[]> = {};
+  for (const [canonical, aliases] of Object.entries(SEMANTIC_ALIASES)) {
+    for (const a of aliases) {
+      if (!rev[a]) rev[a] = [];
+      rev[a].push(canonical);
+    }
+  }
+  return rev;
+})();
+
 function normalizeText(value: string): string {
   return String(value || "")
     .toLowerCase()
@@ -93,7 +106,7 @@ function normalizeText(value: string): string {
 function tokenize(value: string): string[] {
   return normalizeText(value)
     .split(" ")
-    .filter((t) => t.length > 2 && !STOPWORDS.has(t));
+    .filter((t) => (t.length > 2 || CRITICAL_2CHAR.has(t)) && !STOPWORDS.has(t));
 }
 
 function unique(values: string[]): string[] {
@@ -105,6 +118,8 @@ function expandSemanticTokens(tokens: string[]): string[] {
   for (const token of tokens) {
     const aliases = SEMANTIC_ALIASES[token];
     if (aliases) out.push(...aliases);
+    const canonicals = REVERSE_ALIASES[token];
+    if (canonicals) out.push(...canonicals);
   }
   return unique(out);
 }
@@ -170,6 +185,8 @@ export function getSybilPenaltyMultiplier(sybilRisk: string | null, sybilScore: 
   return 1.0;
 }
 
+export type UrgencyLevel = "today" | "this_week" | "this_month" | "flexible" | "unknown";
+
 export interface MatchInput {
   request_text?: string;
   user_request_text?: string;
@@ -177,6 +194,7 @@ export interface MatchInput {
   required_skills?: string[];
   request_id?: string;
   top_k?: number;
+  urgency?: UrgencyLevel;
   constraints?: {
     max_sybil_risk?: string;
     min_alignment_score?: number;
@@ -189,6 +207,7 @@ export interface NormalizedMatchInput {
   request_id: string;
   user_request_text: string;
   required_skills: string[];
+  urgency: UrgencyLevel;
   constraints: {
     max_sybil_risk: string | null;
     min_alignment_score: number | null;
@@ -198,14 +217,19 @@ export interface NormalizedMatchInput {
   top_k: number;
 }
 
+const VALID_URGENCY = new Set<UrgencyLevel>(["today", "this_week", "this_month", "flexible", "unknown"]);
+
 export function normalizeMemberMatchPayload(payload: MatchInput): NormalizedMatchInput {
   const constraints = payload?.constraints && typeof payload.constraints === "object" ? payload.constraints : {};
+  const rawUrgency = (payload?.urgency ?? "unknown").toLowerCase().replace(/\s+/g, "_") as UrgencyLevel;
+  const urgency = VALID_URGENCY.has(rawUrgency) ? rawUrgency : "unknown";
   return {
     request_id: toString(payload?.request_id || randomUUID()),
     user_request_text: toString(payload?.request_text ?? payload?.user_request_text ?? "").trim(),
     required_skills: asArray<string>(payload?.tags ?? payload?.required_skills)
       .map((s) => toString(s).trim())
       .filter(Boolean),
+    urgency,
     constraints: {
       max_sybil_risk: toString(constraints.max_sybil_risk || "").trim() || null,
       min_alignment_score: toNumber(constraints.min_alignment_score ?? null, null),
@@ -381,11 +405,20 @@ function topMatchedDomains(
   return scored.slice(0, 1).map((s) => s.domain);
 }
 
+const URGENCY_ACTIVITY_BONUS: Record<UrgencyLevel, number> = {
+  today: 0.03,
+  this_week: 0.02,
+  this_month: 0.01,
+  flexible: 0,
+  unknown: 0,
+};
+
 function rankOperatorsForTask(
   snapshot: MemberIndexSnapshot,
   operators: OperatorProfile[],
   task: TaskLike,
-  requiredSkills: string[]
+  requiredSkills: string[],
+  urgency: UrgencyLevel = "unknown"
 ): { ranked_results: RankedEntry[] } {
   const integrity = buildIntegrityIndexes(snapshot);
   const sourceText = `${task.title} ${task.requirements}`.trim();
@@ -433,13 +466,17 @@ function rankOperatorsForTask(
     const sybilPenalty = getSybilPenaltyMultiplier(operator.sybil_risk, operator.sybil_score);
     const actScore = computeActivityScore(operator);
 
+    const urgencyBonus =
+      URGENCY_ACTIVITY_BONUS[urgency] * Math.min(1, actScore * 2);
+
     const weightedRaw =
       SCORING_WEIGHTS.semantic * candidate.semanticScore +
       SCORING_WEIGHTS.directOverlap * candidate.overlapScore +
       SCORING_WEIGHTS.multiSkill * multiSkillCoverage +
       SCORING_WEIGHTS.alignment * alignmentScoreNorm +
       SCORING_WEIGHTS.sybil * sybilScoreNorm +
-      SCORING_WEIGHTS.activity * actScore;
+      SCORING_WEIGHTS.activity * actScore +
+      urgencyBonus;
     const overallMatchScore = clamp01(weightedRaw * sybilPenalty);
     if (overallMatchScore < MIN_FINAL_SCORE) continue;
 
@@ -543,7 +580,8 @@ export function runMemberMatchWithDataset(
     dataset,
     constrained,
     task,
-    normalized.required_skills
+    normalized.required_skills,
+    normalized.urgency
   );
   const top = ranked_results.slice(0, normalized.top_k);
 

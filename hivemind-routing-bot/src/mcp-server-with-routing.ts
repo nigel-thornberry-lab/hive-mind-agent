@@ -144,6 +144,7 @@ async function main(): Promise<void> {
     memberIndexLimit: Math.max(1, Math.min(200, Number(process.env.PFT_MEMBER_INDEX_LIMIT) || 40)),
     scanIntervalMs: 30_000,
     cursorFilePath: null,
+    persistStorePath: null,
     healthPort: 0,
   };
   const cache = new MemberIndexCache({ config: memberIndexConfig });

@@ -1,0 +1,18 @@
+[
+  {
+    "id": "typescript-api",
+    "request_text": "Need TypeScript and node expertise for an API",
+    "tags": ["typescript"],
+    "expected_operator_id_in_top3": ["a"]
+  },
+  {
+    "id": "monitoring",
+    "request_text": "Need monitoring and telemetry for our services",
+    "expected_domain_in_top3": ["observability"]
+  },
+  {
+    "id": "react-auth",
+    "request_text": "I need a React + TypeScript engineer to fix auth race conditions and ship this week",
+    "expected_operator_id_in_top3": ["7f129508-935a-42e2-95d0-85907c552c6c"]
+  }
+]
