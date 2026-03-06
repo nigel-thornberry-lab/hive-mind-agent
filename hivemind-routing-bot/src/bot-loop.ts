@@ -4,7 +4,8 @@
  * Uses @postfiatorg/pft-chatbot-mcp for scan_messages, get_message, send_message; runs matching locally.
  */
 
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
+import { homedir } from "node:os";
 import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdirSync } from "node:fs";
 import { createServer } from "node:http";
 import { loadConfig, resolveBotSeed } from "./config.js";
@@ -44,7 +45,9 @@ const JWT_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
-const BOT_LOCK_FILE = ".hivemind-bot-loop.lock";
+// Absolute path in home dir so the lock is process-global regardless of cwd.
+// This prevents duplicate instances when the bot is started from different directories.
+const BOT_LOCK_FILE = join(homedir(), ".hivemind-bot-loop.lock");
 
 async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
   let last: Error | null = null;
@@ -72,7 +75,11 @@ function acquireSingleInstanceLock(lockPath: string): void {
   if (Number.isFinite(existingPid)) {
     try {
       process.kill(existingPid, 0);
-      throw new Error(`Another bot-loop process is already running (pid ${existingPid}).`);
+      throw new Error(
+        `Another bot-loop process is already running (pid ${existingPid}).\n` +
+        `To stop it, run:  kill ${existingPid}\n` +
+        `Or use:           npm run stop`
+      );
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== "ESRCH") throw err;
@@ -286,8 +293,7 @@ async function main(): Promise<void> {
   if (!config.taskNodeJwt) {
     log.warn("PFT_TASKNODE_JWT is not set. Matching will fail; only fallback help replies will be sent.");
   }
-  const lockFilePath = resolve(process.cwd(), BOT_LOCK_FILE);
-  acquireSingleInstanceLock(lockFilePath);
+  acquireSingleInstanceLock(BOT_LOCK_FILE);
 
   const botSeed = resolveBotSeed(config);
   const env: NodeJS.ProcessEnv = {
@@ -764,7 +770,7 @@ async function main(): Promise<void> {
     clearInterval(jwtCheckId);
     mcp.disconnect();
     try {
-      unlinkSync(lockFilePath);
+      unlinkSync(BOT_LOCK_FILE);
     } catch {}
     process.exit(0);
   };
