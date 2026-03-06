@@ -6,7 +6,8 @@
  */
 
 import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
+import { homedir } from "node:os";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -143,8 +144,8 @@ async function main(): Promise<void> {
     memberIndexTtlMs: Math.max(1000, Number(process.env.PFT_MEMBER_INDEX_TTL_MS) || 300_000),
     memberIndexLimit: Math.max(1, Math.min(200, Number(process.env.PFT_MEMBER_INDEX_LIMIT) || 40)),
     scanIntervalMs: 30_000,
-    cursorFilePath: null,
-    persistStorePath: null,
+    cursorFilePath: join(homedir(), ".hivemind-bot-cursor"),
+    persistStorePath: join(homedir(), ".hivemind-bot-store"),
     healthPort: 0,
   };
   const cache = new MemberIndexCache({ config: memberIndexConfig });

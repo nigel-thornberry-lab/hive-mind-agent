@@ -28,8 +28,8 @@ function minimalConfig(overrides: Partial<BotConfig> = {}): BotConfig {
     memberIndexTtlMs: 100,
     memberIndexLimit: 10,
     scanIntervalMs: 5000,
-    cursorFilePath: null,
-    persistStorePath: null,
+    cursorFilePath: "/tmp/test-cursor",
+    persistStorePath: "/tmp/test-store",
     healthPort: 0,
     ...overrides,
   };

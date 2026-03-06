@@ -328,42 +328,39 @@ async function main(): Promise<void> {
   await mcp.connect();
   log.info("MCP connected; starting scan loop.");
 
-  const cursorFilePath = config.cursorFilePath ? resolve(process.cwd(), config.cursorFilePath) : null;
-  let cursor: number | undefined = cursorFilePath ? readCursor(cursorFilePath) : undefined;
+  // resolve() is a no-op when the path is already absolute (home-dir defaults).
+  const cursorFilePath = resolve(process.cwd(), config.cursorFilePath);
+  const isFirstRun = !existsSync(cursorFilePath);
+  let cursor: number | undefined = readCursor(cursorFilePath);
   const scanIntervalMs = config.scanIntervalMs;
   let ready = false;
   let tickInFlight = false;
 
-  const persistDir = config.persistStorePath ? resolve(process.cwd(), config.persistStorePath) : null;
-  const briefStore = persistDir
-    ? (() => {
-        try {
-          if (!existsSync(persistDir)) mkdirSync(persistDir, { recursive: true });
-        } catch {}
-        return new FileBriefStore(resolve(persistDir, "briefs.json"));
-      })()
-    : new InMemoryBriefStore();
-
-  let seenSet: SeenSet;
-  if (persistDir) {
-    const seenPath = resolve(persistDir, "seen.json");
-    let loaded: string[] = [];
+  const persistDir = resolve(process.cwd(), config.persistStorePath);
+  const briefStore = (() => {
     try {
-      if (existsSync(seenPath)) {
-        const raw = readFileSync(seenPath, "utf8");
-        loaded = JSON.parse(raw) as string[];
-      }
+      if (!existsSync(persistDir)) mkdirSync(persistDir, { recursive: true });
     } catch {}
-    seenSet = SeenSet.fromArray(Array.isArray(loaded) ? loaded : []);
-    const SEEN_SAVE_INTERVAL_MS = 60_000;
-    setInterval(() => {
-      try {
-        writeFileSync(seenPath, JSON.stringify(seenSet.toArray()), "utf8");
-      } catch {}
-    }, SEEN_SAVE_INTERVAL_MS);
-  } else {
-    seenSet = new SeenSet();
-  }
+    return new FileBriefStore(resolve(persistDir, "briefs.json"));
+  })();
+
+  const seenPath = resolve(persistDir, "seen.json");
+  let loadedSeen: string[] = [];
+  try {
+    if (existsSync(seenPath)) {
+      const raw = readFileSync(seenPath, "utf8");
+      loadedSeen = JSON.parse(raw) as string[];
+    }
+  } catch {}
+  const seenSet = SeenSet.fromArray(Array.isArray(loadedSeen) ? loadedSeen : []);
+  log.info(`Loaded ${seenSet.size} seen hashes from ${seenPath}`);
+  const flushSeen = (): void => {
+    try {
+      writeFileSync(seenPath, JSON.stringify(seenSet.toArray()), "utf8");
+    } catch {}
+  };
+  const SEEN_SAVE_INTERVAL_MS = 60_000;
+  const seenSaveIntervalId = setInterval(flushSeen, SEEN_SAVE_INTERVAL_MS);
 
   const senderPendingQueues = new SenderPendingQueues({
     onDrop: (txHash) => seenSet.add(txHash),
@@ -371,6 +368,39 @@ async function main(): Promise<void> {
 
   // Proactive cache warmup — block until first load completes so the first
   // real user request never pays cold-start latency.
+  // On first-ever run (no cursor file), fast-forward through all existing messages
+  // and mark them as seen without responding. This prevents replaying conversation
+  // history from before the bot was first started.
+  if (isFirstRun) {
+    log.info("First run detected — fast-forwarding past existing messages (no responses will be sent)…");
+    let ffCursor: number | undefined = undefined;
+    let ffPages = 0;
+    const MAX_FF_PAGES = 100;
+    while (ffPages < MAX_FF_PAGES) {
+      const ffParams: Record<string, unknown> = { limit: 50, direction: "inbound" };
+      if (ffCursor != null) ffParams.since_ledger = ffCursor;
+      try {
+        const scanText = await withRetry(() => mcp.callTool("scan_messages", ffParams));
+        const scan = parseScanResult(scanText);
+        const msgs = scan.messages ?? [];
+        for (const msg of msgs) {
+          if (msg.tx_hash) seenSet.add(msg.tx_hash);
+        }
+        if (scan.next_cursor != null) ffCursor = scan.next_cursor;
+        if (msgs.length < 50) break;
+        ffPages++;
+      } catch {
+        break;
+      }
+    }
+    if (ffCursor != null) {
+      cursor = ffCursor;
+      writeCursor(cursorFilePath, cursor);
+    }
+    flushSeen();
+    log.info(`Fast-forward complete: ${seenSet.size} messages skipped, cursor set to ${cursor ?? "unknown"}.`);
+  }
+
   log.info("Warming member-index cache…");
   try {
     const warmT0 = Date.now();
@@ -702,11 +732,9 @@ async function main(): Promise<void> {
       // Persist cursor only after message processing completes (at-least-once semantics).
       if (nextCursorCandidate != null) {
         cursor = nextCursorCandidate;
-        if (cursorFilePath) {
-          const ok = writeCursor(cursorFilePath, cursor);
-          if (!ok) log.warn("Cursor file write failed; next tick will replay from previous cursor.");
-          log.cursorCommit(ok, cursor, ok ? undefined : "write failed");
-        }
+        const ok = writeCursor(cursorFilePath, cursor);
+        if (!ok) log.warn("Cursor file write failed; next tick will replay from previous cursor.");
+        log.cursorCommit(ok, cursor, ok ? undefined : "write failed");
       }
     } catch (err) {
       log.error(redactSecrets((err as Error).message), "scan_tick");
@@ -768,6 +796,9 @@ async function main(): Promise<void> {
     clearInterval(sweepIntervalId);
     clearInterval(cacheRefreshId);
     clearInterval(jwtCheckId);
+    clearInterval(seenSaveIntervalId);
+    // Flush seenSet to disk so restarts don't replay already-processed messages.
+    flushSeen();
     mcp.disconnect();
     try {
       unlinkSync(BOT_LOCK_FILE);
