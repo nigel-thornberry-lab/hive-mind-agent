@@ -41,13 +41,20 @@ const CRITICAL_2CHAR = new Set(["ai", "ui", "ux"]);
 const EMBEDDING_DIMS = 256;
 const MIN_RETRIEVAL_SCORE = 0.15;
 const MIN_FINAL_SCORE = 0.18;
+const MIN_RELATIVE_TOP_SCORE_GAP = 0.12;
+const MAX_EXACT_DOMAIN_BOOST = 0.14;
+const MAX_EXACT_CAPABILITY_BOOST = 0.14;
+const NEAR_PERFECT_MATCH_BONUS = 0.12;
+const STRONG_MATCH_CALIBRATION_MAX_BOOST = 0.55;
 const SCORING_WEIGHTS = {
-  semantic: 0.28,
-  directOverlap: 0.17,
-  multiSkill: 0.22,
-  alignment: 0.15,
-  sybil: 0.1,
-  activity: 0.08,
+  semantic: 0.22,
+  directOverlap: 0.2,
+  multiSkill: 0.24,
+  domainExpertise: 0.16,
+  capabilityFit: 0.12,
+  alignment: 0.04,
+  sybil: 0.02,
+  activity: 0.01,
 };
 
 const SEMANTIC_ALIASES: Record<string, string[]> = {
@@ -223,6 +230,10 @@ export function normalizeMemberMatchPayload(payload: MatchInput): NormalizedMatc
   const constraints = payload?.constraints && typeof payload.constraints === "object" ? payload.constraints : {};
   const rawUrgency = (payload?.urgency ?? "unknown").toLowerCase().replace(/\s+/g, "_") as UrgencyLevel;
   const urgency = VALID_URGENCY.has(rawUrgency) ? rawUrgency : "unknown";
+  const rawMinAlignment = constraints.min_alignment_score;
+  const minAlignmentScore = rawMinAlignment === null || rawMinAlignment === undefined
+    ? null
+    : toNumber(rawMinAlignment, null);
   return {
     request_id: toString(payload?.request_id || randomUUID()),
     user_request_text: toString(payload?.request_text ?? payload?.user_request_text ?? "").trim(),
@@ -232,7 +243,7 @@ export function normalizeMemberMatchPayload(payload: MatchInput): NormalizedMatc
     urgency,
     constraints: {
       max_sybil_risk: toString(constraints.max_sybil_risk || "").trim() || null,
-      min_alignment_score: toNumber(constraints.min_alignment_score ?? null, null),
+      min_alignment_score: minAlignmentScore,
       public_only: Boolean(constraints.public_only),
       exclude_operator_ids: asArray<string>(constraints.exclude_operator_ids)
         .map((s) => toString(s).trim())
@@ -337,6 +348,27 @@ function splitIntentFacets(taskText: string, requiredSkills: string[]): string[]
   return unique([...fromSkills, ...base]).slice(0, 8);
 }
 
+function extractQueryPhrases(taskText: string, requiredSkills: string[]): string[] {
+  const skillPhrases = requiredSkills
+    .map((s) => normalizeText(s))
+    .filter((s) => s.length >= 4);
+  const sentencePhrases = normalizeText(taskText)
+    .split(/\b(and|with|plus|for)\b|[|,;:.!?()]/g)
+    .map((s) => normalizeText(s))
+    .filter(Boolean)
+    .filter((s) => s.length >= 10 || s.split(" ").length >= 2);
+  return unique([...skillPhrases, ...sentencePhrases]).slice(0, 14);
+}
+
+function extractStrongSkillPhrases(requiredSkills: string[]): string[] {
+  return unique(
+    requiredSkills
+      .map((s) => normalizeText(s))
+      .filter(Boolean)
+      .filter((s) => s.length >= 3)
+  ).slice(0, 10);
+}
+
 function computeActivityScore(op: OperatorProfile): number {
   const weekly = Number(op.weekly_tasks ?? 0);
   const monthly = Number(op.monthly_tasks ?? 0);
@@ -364,9 +396,157 @@ function directTokenOverlap(queryTokens: string[], operatorTokens: string[]): nu
   return matches / queryTokens.length;
 }
 
+function hasAnyTokenOverlap(queryTokens: string[], operatorTokens: string[]): boolean {
+  if (queryTokens.length === 0 || operatorTokens.length === 0) return false;
+  const opSet = new Set(operatorTokens);
+  for (const token of queryTokens) {
+    if (opSet.has(token)) return true;
+  }
+  return false;
+}
+
 function operatorExpandedTokens(op: OperatorProfile): string[] {
   const text = operatorSemanticText(op);
   return expandSemanticTokens(tokenize(text));
+}
+
+function domainExpertiseFitScore(
+  queryEmbedding: Float64Array,
+  queryTokens: string[],
+  op: OperatorProfile
+): number {
+  const domains = asArray<{ domain?: string }>(op.expert_knowledge)
+    .map((d) => (d?.domain ?? "").trim())
+    .filter(Boolean);
+  if (domains.length === 0) return 0;
+
+  const scored = domains
+    .map((domain) => {
+      const semantic = cosine(queryEmbedding, embedText(domain));
+      const overlap = directTokenOverlap(queryTokens, expandSemanticTokens(tokenize(domain)));
+      return 0.75 * semantic + 0.25 * overlap;
+    })
+    .sort((a, b) => b - a);
+
+  const take = scored.slice(0, Math.min(3, scored.length));
+  return take.reduce((sum, s) => sum + s, 0) / take.length;
+}
+
+function capabilityFitScore(
+  queryEmbedding: Float64Array,
+  queryTokens: string[],
+  op: OperatorProfile
+): number {
+  const caps = asArray<string>(op.capabilities)
+    .map((c) => c.trim())
+    .filter(Boolean);
+  if (caps.length === 0) return 0;
+
+  const scored = caps
+    .map((capability) => {
+      const semantic = cosine(queryEmbedding, embedText(capability));
+      const overlap = directTokenOverlap(queryTokens, expandSemanticTokens(tokenize(capability)));
+      return 0.65 * semantic + 0.35 * overlap;
+    })
+    .sort((a, b) => b - a);
+  const top1 = scored[0] ?? 0;
+  const top2 = scored[1] ?? top1;
+  const top3 = scored[2] ?? top2;
+  return clamp01(0.7 * top1 + 0.2 * top2 + 0.1 * top3);
+}
+
+function phraseHitRate(phrases: string[], candidateTexts: string[]): number {
+  if (phrases.length === 0 || candidateTexts.length === 0) return 0;
+  let hits = 0;
+  for (const phrase of phrases) {
+    const hit = candidateTexts.some((c) => c.includes(phrase) || phrase.includes(c));
+    if (hit) hits++;
+  }
+  return clamp01(hits / phrases.length);
+}
+
+function exactMatchBoost(
+  queryPhrases: string[],
+  strongSkillPhrases: string[],
+  op: OperatorProfile
+): {
+  domainBoost: number;
+  capabilityBoost: number;
+  domainHitRate: number;
+  capabilityHitRate: number;
+} {
+  if (queryPhrases.length === 0) {
+    return { domainBoost: 0, capabilityBoost: 0, domainHitRate: 0, capabilityHitRate: 0 };
+  }
+  const domainTexts = asArray<{ domain?: string }>(op.expert_knowledge)
+    .map((d) => normalizeText(d?.domain ?? ""))
+    .filter(Boolean);
+  const capabilityTexts = asArray<string>(op.capabilities)
+    .map((c) => normalizeText(c))
+    .filter(Boolean);
+
+  const broadDomainHitRate = phraseHitRate(queryPhrases, domainTexts);
+  const broadCapabilityHitRate = phraseHitRate(queryPhrases, capabilityTexts);
+  const strongDomainHitRate = phraseHitRate(strongSkillPhrases, domainTexts);
+  const strongCapabilityHitRate = phraseHitRate(strongSkillPhrases, capabilityTexts);
+  const domainHitRate = clamp01(0.35 * broadDomainHitRate + 0.65 * strongDomainHitRate);
+  const capabilityHitRate = clamp01(0.35 * broadCapabilityHitRate + 0.65 * strongCapabilityHitRate);
+  return {
+    domainBoost: MAX_EXACT_DOMAIN_BOOST * domainHitRate,
+    capabilityBoost: MAX_EXACT_CAPABILITY_BOOST * capabilityHitRate,
+    domainHitRate,
+    capabilityHitRate,
+  };
+}
+
+function hasMinimumTagOverlap(
+  strongSkillPhrases: string[],
+  strongSkillTokens: string[],
+  op: OperatorProfile,
+  operatorTokens: string[]
+): boolean {
+  if (strongSkillPhrases.length === 0) return true;
+  const domainTexts = asArray<{ domain?: string }>(op.expert_knowledge)
+    .map((d) => normalizeText(d?.domain ?? ""))
+    .filter(Boolean);
+  const capabilityTexts = asArray<string>(op.capabilities)
+    .map((c) => normalizeText(c))
+    .filter(Boolean);
+  const phraseOverlap = phraseHitRate(strongSkillPhrases, [...domainTexts, ...capabilityTexts]) > 0;
+  const tokenOverlap = hasAnyTokenOverlap(strongSkillTokens, operatorTokens);
+  return phraseOverlap || tokenOverlap;
+}
+
+function nearPerfectMatchBonus(
+  exact: { domainHitRate: number; capabilityHitRate: number },
+  domainFit: number,
+  capabilityFit: number
+): number {
+  const combinedHit = (exact.domainHitRate + exact.capabilityHitRate) / 2;
+  const combinedFit = (domainFit + capabilityFit) / 2;
+  const thresholdPassed =
+    exact.domainHitRate >= 0.5 &&
+    exact.capabilityHitRate >= 0.35 &&
+    domainFit >= 0.45 &&
+    capabilityFit >= 0.4;
+  if (!thresholdPassed) return 0;
+  // Scale the tier bonus by how strong the exact+semantic agreement is.
+  return NEAR_PERFECT_MATCH_BONUS * clamp01(0.55 * combinedHit + 0.45 * combinedFit);
+}
+
+function calibrateStrongMatchScore(
+  baseScore: number,
+  exact: { domainHitRate: number; capabilityHitRate: number },
+  domainFit: number,
+  capabilityFit: number,
+  multiSkillCoverage: number
+): number {
+  const exactAgreement = (exact.domainHitRate + exact.capabilityHitRate) / 2;
+  const semanticAgreement = (domainFit + capabilityFit + multiSkillCoverage) / 3;
+  const fitStrength = clamp01(0.55 * exactAgreement + 0.45 * semanticAgreement);
+  if (fitStrength < 0.35) return baseScore;
+  const boosted = baseScore + STRONG_MATCH_CALIBRATION_MAX_BOOST * ((fitStrength - 0.35) / 0.65);
+  return clamp01(boosted);
 }
 
 function generateContextualReasoning(
@@ -406,9 +586,9 @@ function topMatchedDomains(
 }
 
 const URGENCY_ACTIVITY_BONUS: Record<UrgencyLevel, number> = {
-  today: 0.03,
-  this_week: 0.02,
-  this_month: 0.01,
+  today: 0.008,
+  this_week: 0.005,
+  this_month: 0.002,
   flexible: 0,
   unknown: 0,
 };
@@ -425,6 +605,9 @@ function rankOperatorsForTask(
   const queryEmbedding = embedText(sourceText);
   const queryTokens = expandSemanticTokens(tokenize(sourceText));
   const intentFacets = splitIntentFacets(sourceText, requiredSkills);
+  const queryPhrases = extractQueryPhrases(sourceText, requiredSkills);
+  const strongSkillPhrases = extractStrongSkillPhrases(requiredSkills);
+  const strongSkillTokens = expandSemanticTokens(tokenize(strongSkillPhrases.join(" ")));
   const facetEmbeddings = intentFacets.map((f) => embedText(f));
 
   const retrieved = operators
@@ -445,6 +628,9 @@ function rankOperatorsForTask(
 
   for (const candidate of retrieved) {
     const operator = candidate.operator;
+    if (!hasMinimumTagOverlap(strongSkillPhrases, strongSkillTokens, operator, candidate.opTokens)) {
+      continue;
+    }
     const opId = operator.operator_id ?? "";
     const wallet = operator.wallet_address ?? "";
     const isHardBlocked =
@@ -465,6 +651,10 @@ function rankOperatorsForTask(
     const sybilScoreNorm = clamp01(Number(operator.sybil_score ?? 0) / 100);
     const sybilPenalty = getSybilPenaltyMultiplier(operator.sybil_risk, operator.sybil_score);
     const actScore = computeActivityScore(operator);
+    const domainFit = domainExpertiseFitScore(queryEmbedding, queryTokens, operator);
+    const capabilityFit = capabilityFitScore(queryEmbedding, queryTokens, operator);
+    const exactBoost = exactMatchBoost(queryPhrases, strongSkillPhrases, operator);
+    const perfectBoost = nearPerfectMatchBonus(exactBoost, domainFit, capabilityFit);
 
     const urgencyBonus =
       URGENCY_ACTIVITY_BONUS[urgency] * Math.min(1, actScore * 2);
@@ -473,11 +663,23 @@ function rankOperatorsForTask(
       SCORING_WEIGHTS.semantic * candidate.semanticScore +
       SCORING_WEIGHTS.directOverlap * candidate.overlapScore +
       SCORING_WEIGHTS.multiSkill * multiSkillCoverage +
+      SCORING_WEIGHTS.domainExpertise * domainFit +
+      SCORING_WEIGHTS.capabilityFit * capabilityFit +
       SCORING_WEIGHTS.alignment * alignmentScoreNorm +
       SCORING_WEIGHTS.sybil * sybilScoreNorm +
       SCORING_WEIGHTS.activity * actScore +
+      exactBoost.domainBoost +
+      exactBoost.capabilityBoost +
+      perfectBoost +
       urgencyBonus;
-    const overallMatchScore = clamp01(weightedRaw * sybilPenalty);
+    const rawScore = clamp01(weightedRaw * sybilPenalty);
+    const overallMatchScore = calibrateStrongMatchScore(
+      rawScore,
+      exactBoost,
+      domainFit,
+      capabilityFit,
+      multiSkillCoverage
+    );
     if (overallMatchScore < MIN_FINAL_SCORE) continue;
 
     const matchedDomains = topMatchedDomains(queryEmbedding, operator, 3);
@@ -511,6 +713,16 @@ function rankOperatorsForTask(
   }
 
   reranked.sort((a, b) => b.overall_match_score - a.overall_match_score);
+  let qualityFloor = MIN_FINAL_SCORE;
+  if (reranked.length > 1) {
+    const topScore = reranked[0].overall_match_score;
+    qualityFloor = Math.max(MIN_FINAL_SCORE, topScore - MIN_RELATIVE_TOP_SCORE_GAP);
+    const qualityFiltered = reranked.filter(
+      (item, idx) => idx === 0 || item.overall_match_score >= qualityFloor
+    );
+    reranked.length = 0;
+    reranked.push(...qualityFiltered);
+  }
   reranked.forEach((item, i) => {
     item.rank = i + 1;
   });
@@ -520,8 +732,8 @@ function rankOperatorsForTask(
     const seen = new Set(reranked.map((r) => r.operator_id));
     const backup = [...fallbackPool]
       .sort((a, b) => b.overall_match_score - a.overall_match_score)
-      .find((c) => !seen.has(c.operator_id));
-    if (backup) {
+      .find((c) => !seen.has(c.operator_id) && c.overall_match_score >= qualityFloor);
+    if (backup && backup.overall_match_score >= qualityFloor) {
       reranked.push({
         ...backup,
         rank: 2,

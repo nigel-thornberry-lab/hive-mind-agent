@@ -374,4 +374,100 @@ describe("runMemberMatchWithDataset", () => {
     assert.ok(result.top_matches.length >= 1);
     assert.strictEqual(result.top_matches[0].operator_id, "d6453c54-94b1-467d-a376-6512130cc779");
   });
+
+  it("significantly boosts exact expert knowledge + capability phrase matches", () => {
+    const exact = mockOperator({
+      operator_id: "exact",
+      wallet_address: "rExact",
+      summary: "B2B growth systems operator",
+      capabilities: [
+        "Execute data-driven B2B outreach and lead generation strategies using industry-specific positioning.",
+      ],
+      expert_knowledge: [
+        { domain: "Sales outreach strategy", confidence: null },
+        { domain: "Lead generation systems", confidence: null },
+      ],
+      weekly_tasks: 1,
+      monthly_tasks: 4,
+    });
+    const genericButActive = mockOperator({
+      operator_id: "generic-active",
+      wallet_address: "rGeneric",
+      summary: "Generalist builder",
+      capabilities: ["Build web applications and APIs quickly."],
+      expert_knowledge: [{ domain: "Full stack web development", confidence: null }],
+      weekly_tasks: 40,
+      monthly_tasks: 100,
+    });
+    const snapshot = mockSnapshot([genericButActive, exact]);
+    const result = runMemberMatchWithDataset(
+      {
+        request_text:
+          "Need a member to run B2B sales outreach, lead generation, and outbound messaging strategy.",
+        tags: ["b2b outreach", "lead generation", "sales outreach"],
+      },
+      snapshot
+    );
+    assert.strictEqual(result.ok, true);
+    assert.ok(result.top_matches.length >= 1);
+    assert.strictEqual(result.top_matches[0].operator_id, "exact");
+    assert.ok(
+      result.top_matches[0].overall_match_score > 0.3,
+      `expected exact match score > 0.3, got ${result.top_matches[0].overall_match_score}`
+    );
+  });
+
+  it("does not include weak backup matches below quality threshold", () => {
+    const strong = mockOperator({
+      operator_id: "strong-sales",
+      wallet_address: "rStrong",
+      summary: "B2B sales systems operator",
+      capabilities: ["Run B2B outreach campaigns with targeted lead generation and outbound sequences."],
+      expert_knowledge: [
+        { domain: "Sales outreach strategy", confidence: null },
+        { domain: "Lead generation systems", confidence: null },
+      ],
+      weekly_tasks: 10,
+    });
+    const weak = mockOperator({
+      operator_id: "weak-unrelated",
+      wallet_address: "rWeak",
+      summary: "General full-stack web developer",
+      capabilities: ["Build dashboards and APIs."],
+      expert_knowledge: [{ domain: "Frontend development", confidence: null }],
+      weekly_tasks: 30,
+    });
+    const snapshot = mockSnapshot([strong, weak]);
+    const result = runMemberMatchWithDataset(
+      {
+        request_text:
+          "Need B2B sales outreach support with outbound messaging and lead generation.",
+        tags: ["b2b outreach", "sales outreach", "lead generation"],
+      },
+      snapshot
+    );
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.top_matches.length, 1, "weak backup should be filtered out");
+    assert.strictEqual(result.top_matches[0].operator_id, "strong-sales");
+  });
+
+  it("requires at least one tag overlap when tags are provided", () => {
+    const unrelated = mockOperator({
+      operator_id: "unrelated",
+      wallet_address: "rUnrelated",
+      summary: "General infrastructure engineer",
+      capabilities: ["Build Kubernetes pipelines and CI/CD automation."],
+      expert_knowledge: [{ domain: "Cloud infrastructure", confidence: null }],
+    });
+    const snapshot = mockSnapshot([unrelated]);
+    const result = runMemberMatchWithDataset(
+      {
+        request_text: "Need B2B outreach support for sales pipeline",
+        tags: ["b2b outreach", "sales outreach", "lead generation"],
+      },
+      snapshot
+    );
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.top_matches.length, 0, "no overlap means no matches");
+  });
 });

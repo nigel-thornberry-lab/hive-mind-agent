@@ -157,12 +157,10 @@ function shortWallet(value: string): string {
 function deriveRiskLines(match: {
   sybil_risk?: string | null;
   alignment_score?: number | null;
-  confidence?: number;
 }): string[] {
   const risks: string[] = [];
   const sybil = (match.sybil_risk ?? "").toLowerCase();
   const alignment = Number(match.alignment_score ?? 0);
-  const confidence = Number(match.confidence ?? 0);
 
   if (sybil.includes("high") || sybil.includes("elevated")) {
     risks.push(`Trust signal: ${match.sybil_risk ?? "elevated risk"}`);
@@ -172,10 +170,6 @@ function deriveRiskLines(match: {
 
   if (alignment > 0 && alignment < 60) {
     risks.push(`Alignment score is lower (${alignment}); scope tightly and set milestones.`);
-  }
-
-  if (confidence < 0.35) {
-    risks.push("Lower confidence match; ask for relevant portfolio examples first.");
   }
 
   if (risks.length === 0) {
@@ -189,6 +183,7 @@ interface CardMatch {
   operator_id?: string;
   wallet_address?: string;
   confidence?: number;
+  overall_match_score?: number;
   reasoning?: string;
   matched_expert_domains?: string[];
   sybil_risk?: string | null;
@@ -196,6 +191,14 @@ interface CardMatch {
   summary?: string | null;
   capability_highlights?: string[];
   activity_level?: string;
+}
+
+function deriveFitTier(match: CardMatch, topScore: number): "Elite fit" | "Strong fit" | "Backup fit" {
+  const score = Number(match.overall_match_score ?? match.confidence ?? 0);
+  const relative = topScore > 0 ? score / topScore : 0;
+  if (score >= 0.75 || relative >= 0.93) return "Elite fit";
+  if (score >= 0.45 || relative >= 0.75) return "Strong fit";
+  return "Backup fit";
 }
 
 function formatTop3Reply(
@@ -215,11 +218,15 @@ function formatTop3Reply(
   const lines: string[] = [
     `Here are your top ${matchResult.top_matches.length} matches:`,
   ];
+  const topScore = Number(
+    matchResult.top_matches[0]?.overall_match_score ??
+      matchResult.top_matches[0]?.confidence ??
+      0
+  );
   for (const m of matchResult.top_matches) {
     const wallet = m.wallet_address ?? m.operator_id ?? "Unknown";
     const meta = operatorMeta.get(wallet);
     const nameOrWallet = meta?.walletLabel?.trim() || shortWallet(wallet);
-    const percent = Math.round((m.confidence ?? 0) * 100);
     const matched = (m.matched_expert_domains ?? []).filter(Boolean).slice(0, 2);
 
     const whyLine = m.reasoning && !m.reasoning.startsWith("Semantic fit")
@@ -231,11 +238,13 @@ function formatTop3Reply(
     const riskLines = deriveRiskLines(m);
     const riskLine = riskLines[0] ?? "No major risk flags.";
     const openChatLink = buildTaskNodeChatLink(wallet);
+    const fitTier = deriveFitTier(m, topScore);
 
     lines.push(
       [
         `--- Match ${m.rank}: ${nameOrWallet} ---`,
-        `Match: ${percent}% · ${whyLine}`,
+        `Fit: ${fitTier}`,
+        `Why: ${whyLine}`,
         `Signals: ${matched.length > 0 ? matched.join(", ") : "General profile alignment"}`,
         `Risk: ${riskLine}`,
         `Chat: ${openChatLink}`,
