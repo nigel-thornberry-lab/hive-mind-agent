@@ -7,6 +7,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/src/bot-loop.js",
+    "stop": "node -e \"const{readFileSync,existsSync,unlinkSync}=require('fs');const{homedir}=require('os');const{join}=require('path');const f=join(homedir(),'.hivemind-bot-loop.lock');if(!existsSync(f)){console.log('No running bot found.');process.exit(0);}const pid=Number(readFileSync(f,'utf8').trim());try{process.kill(pid,'SIGTERM');unlinkSync(f);console.log('Bot stopped (pid '+pid+')');}catch(e){if(e.code==='ESRCH'){unlinkSync(f);console.log('Stale lock removed (process was already gone).');}else throw e;}\"",
     "mcp:server": "node dist/src/mcp-server-with-routing.js",
     "dev": "tsx src/bot-loop.ts",
     "test": "node --test dist/test/*.test.js",

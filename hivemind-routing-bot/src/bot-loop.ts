@@ -4,11 +4,13 @@
  * Uses @postfiatorg/pft-chatbot-mcp for scan_messages, get_message, send_message; runs matching locally.
  */
 
-import { resolve } from "node:path";
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { resolve, join } from "node:path";
+import { homedir } from "node:os";
+import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdirSync } from "node:fs";
 import { createServer } from "node:http";
 import { loadConfig, resolveBotSeed } from "./config.js";
 import { assertSeedFilePermissions, redactSecrets } from "./security.js";
+import { readCursor, writeCursor } from "./cursor.js";
 import { MemberIndexCache } from "./member-index-cache.js";
 import { runMemberMatchWithDataset } from "./match-adapter.js";
 import { McpStdioClient } from "./mcp-stdio-client.js";
@@ -17,16 +19,35 @@ import {
   finalizeRankedBrief,
   startOrContinueMatchBrief,
 } from "./conversation-state-machine.js";
-import type { MatchBrief, RankedCandidate } from "./match-brief.js";
+import { FileBriefStore } from "./file-brief-store.js";
+import { SenderPendingQueues, type PendingMessage } from "./sender-queue.js";
+import { SeenSet } from "./seen-set.js";
+import { buildMatchRequestText, type MatchBrief, type RankedCandidate } from "./match-brief.js";
 import { getQuestionPromptById } from "./question-policy.js";
 import { defaultLogger, generateRequestId } from "./logger.js";
 
 const PFT_CHATBOT_MCP_PATH = resolve(process.cwd(), "node_modules/@postfiatorg/pft-chatbot-mcp/dist/index.js");
 
+function parseJwtExpiry(jwt: string | null): number | null {
+  if (!jwt) return null;
+  try {
+    const parts = jwt.split(".");
+    if (parts.length !== 3) return null;
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
+    return typeof payload.exp === "number" ? payload.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+const JWT_WARN_THRESHOLD_MS = 60 * 60 * 1000;
+const JWT_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
-const MAX_SEEN_TX_HASHES = 5000;
-const BOT_LOCK_FILE = ".hivemind-bot-loop.lock";
+// Absolute path in home dir so the lock is process-global regardless of cwd.
+// This prevents duplicate instances when the bot is started from different directories.
+const BOT_LOCK_FILE = join(homedir(), ".hivemind-bot-loop.lock");
 
 async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
   let last: Error | null = null;
@@ -44,25 +65,6 @@ async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
   throw last;
 }
 
-function readCursor(path: string): number | undefined {
-  try {
-    if (!existsSync(path)) return undefined;
-    const s = readFileSync(path, "utf8").trim();
-    const n = parseInt(s, 10);
-    return Number.isFinite(n) ? n : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function writeCursor(path: string, value: number): void {
-  try {
-    writeFileSync(path, String(value), "utf8");
-  } catch (err) {
-    console.error("[bot] Failed to write cursor file:", redactSecrets((err as Error).message));
-  }
-}
-
 function acquireSingleInstanceLock(lockPath: string): void {
   if (!existsSync(lockPath)) {
     writeFileSync(lockPath, String(process.pid), { encoding: "utf8", flag: "wx" });
@@ -73,7 +75,11 @@ function acquireSingleInstanceLock(lockPath: string): void {
   if (Number.isFinite(existingPid)) {
     try {
       process.kill(existingPid, 0);
-      throw new Error(`Another bot-loop process is already running (pid ${existingPid}).`);
+      throw new Error(
+        `Another bot-loop process is already running (pid ${existingPid}).\n` +
+        `To stop it, run:  kill ${existingPid}\n` +
+        `Or use:           npm run stop`
+      );
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== "ESRCH") throw err;
@@ -151,12 +157,10 @@ function shortWallet(value: string): string {
 function deriveRiskLines(match: {
   sybil_risk?: string | null;
   alignment_score?: number | null;
-  confidence?: number;
 }): string[] {
   const risks: string[] = [];
   const sybil = (match.sybil_risk ?? "").toLowerCase();
   const alignment = Number(match.alignment_score ?? 0);
-  const confidence = Number(match.confidence ?? 0);
 
   if (sybil.includes("high") || sybil.includes("elevated")) {
     risks.push(`Trust signal: ${match.sybil_risk ?? "elevated risk"}`);
@@ -166,10 +170,6 @@ function deriveRiskLines(match: {
 
   if (alignment > 0 && alignment < 60) {
     risks.push(`Alignment score is lower (${alignment}); scope tightly and set milestones.`);
-  }
-
-  if (confidence < 0.35) {
-    risks.push("Lower confidence match; ask for relevant portfolio examples first.");
   }
 
   if (risks.length === 0) {
@@ -183,6 +183,7 @@ interface CardMatch {
   operator_id?: string;
   wallet_address?: string;
   confidence?: number;
+  overall_match_score?: number;
   reasoning?: string;
   matched_expert_domains?: string[];
   sybil_risk?: string | null;
@@ -190,6 +191,14 @@ interface CardMatch {
   summary?: string | null;
   capability_highlights?: string[];
   activity_level?: string;
+}
+
+function deriveFitTier(match: CardMatch, topScore: number): "Elite fit" | "Strong fit" | "Backup fit" {
+  const score = Number(match.overall_match_score ?? match.confidence ?? 0);
+  const relative = topScore > 0 ? score / topScore : 0;
+  if (score >= 0.75 || relative >= 0.93) return "Elite fit";
+  if (score >= 0.45 || relative >= 0.75) return "Strong fit";
+  return "Backup fit";
 }
 
 function formatTop3Reply(
@@ -209,12 +218,16 @@ function formatTop3Reply(
   const lines: string[] = [
     `Here are your top ${matchResult.top_matches.length} matches:`,
   ];
+  const topScore = Number(
+    matchResult.top_matches[0]?.overall_match_score ??
+      matchResult.top_matches[0]?.confidence ??
+      0
+  );
   for (const m of matchResult.top_matches) {
     const wallet = m.wallet_address ?? m.operator_id ?? "Unknown";
     const meta = operatorMeta.get(wallet);
     const nameOrWallet = meta?.walletLabel?.trim() || shortWallet(wallet);
-    const percent = Math.round((m.confidence ?? 0) * 100);
-    const matched = (m.matched_expert_domains ?? []).filter(Boolean).slice(0, 3);
+    const matched = (m.matched_expert_domains ?? []).filter(Boolean).slice(0, 2);
 
     const whyLine = m.reasoning && !m.reasoning.startsWith("Semantic fit")
       ? m.reasoning
@@ -222,36 +235,24 @@ function formatTop3Reply(
         ? `Proven expertise in ${matched.join(", ")}.`
         : "Profile signals align with your request.";
 
-    const capLines = (m.capability_highlights ?? meta?.capabilities ?? [])
-      .filter(Boolean)
-      .slice(0, 2);
-
     const riskLines = deriveRiskLines(m);
+    const riskLine = riskLines[0] ?? "No major risk flags.";
     const openChatLink = buildTaskNodeChatLink(wallet);
-    const actLine = m.activity_level && m.activity_level.includes("active")
-      ? `Activity: ${m.activity_level}`
-      : null;
+    const fitTier = deriveFitTier(m, topScore);
 
     lines.push(
       [
-        `==== MATCH ${m.rank} ====`,
-        `${nameOrWallet} (${wallet})`,
-        `Match: ${percent}%`,
+        `--- Match ${m.rank}: ${nameOrWallet} ---`,
+        `Fit: ${fitTier}`,
         `Why: ${whyLine}`,
-        "Signals:",
-        ...(matched.length > 0 ? matched.map((s) => `  - ${s}`) : ["  - General profile alignment"]),
-        ...(capLines.length > 0 ? capLines.map((c) => `  - ${c}`) : []),
-        actLine,
-        "Risk:",
-        ...riskLines.map((r) => `  - ${r}`),
-        `Open chat: ${openChatLink}`,
-      ]
-        .filter(Boolean)
-        .join("\n")
+        `Signals: ${matched.length > 0 ? matched.join(", ") : "General profile alignment"}`,
+        `Risk: ${riskLine}`,
+        `Chat: ${openChatLink}`,
+      ].join("\n")
     );
     lines.push("");
   }
-  lines.push("Reply with a wallet address or name to learn more, or run /match again to refine.");
+  lines.push("Reply 1, 2, or 3 to connect with that match, or run /match again to refine.");
   return lines.join("\n");
 }
 
@@ -267,41 +268,31 @@ function formatHelpReply(): string {
     "Example:",
     "/match I need help creating an NFT collection on-chain and shipping metadata this week",
     "",
-    "After /match, reply naturally to any clarifying question (or say: run now).",
+    "After /match, reply with plain text or /match your answer. Say \"run now\" to skip clarifying questions.",
     "This command is priced at 5 PFT.",
   ].join("\n");
 }
 
 function formatClarifier(prompt: string): string {
   return [
-    "Quick question before ranking:",
     prompt,
     "",
-    "Reply in one message, or say: run now",
+    "(Reply with your answer in plain text, or /match your answer, or /match run now to skip)",
   ].join("\n");
 }
 
 function formatPendingQuestionReminder(prompt: string): string {
   return [
-    "Please answer the current question before starting a new /match request.",
+    "Still waiting on your earlier question:",
     "",
-    `Pending question: ${prompt}`,
+    prompt,
     "",
-    "Reply in one message, or say: run now",
+    "(Reply with your answer in plain text, or /match your answer, or /match run now to skip)",
   ].join("\n");
 }
 
 function buildRequestTextFromBrief(brief: MatchBrief): string {
-  const parts = [
-    brief.objective ?? "",
-    brief.deliverable ? `Deliverable: ${brief.deliverable}` : "",
-    brief.must_have_skills.length ? `Must-have: ${brief.must_have_skills.join(", ")}` : "",
-    brief.nice_to_have_skills.length ? `Nice-to-have: ${brief.nice_to_have_skills.join(", ")}` : "",
-    brief.urgency !== "unknown" ? `Urgency: ${brief.urgency}` : "",
-    brief.budget_pft != null ? `Budget: ${brief.budget_pft} PFT` : "",
-    brief.budget_band !== "unknown" ? `Budget band: ${brief.budget_band}` : "",
-  ].filter(Boolean);
-  return parts.join("\n").trim();
+  return buildMatchRequestText(brief);
 }
 
 async function main(): Promise<void> {
@@ -311,8 +302,7 @@ async function main(): Promise<void> {
   if (!config.taskNodeJwt) {
     log.warn("PFT_TASKNODE_JWT is not set. Matching will fail; only fallback help replies will be sent.");
   }
-  const lockFilePath = resolve(process.cwd(), BOT_LOCK_FILE);
-  acquireSingleInstanceLock(lockFilePath);
+  acquireSingleInstanceLock(BOT_LOCK_FILE);
 
   const botSeed = resolveBotSeed(config);
   const env: NodeJS.ProcessEnv = {
@@ -347,69 +337,202 @@ async function main(): Promise<void> {
   await mcp.connect();
   log.info("MCP connected; starting scan loop.");
 
-  const cursorFilePath = config.cursorFilePath ? resolve(process.cwd(), config.cursorFilePath) : null;
-  let cursor: number | undefined = cursorFilePath ? readCursor(cursorFilePath) : undefined;
+  // resolve() is a no-op when the path is already absolute (home-dir defaults).
+  const cursorFilePath = resolve(process.cwd(), config.cursorFilePath);
+  const isFirstRun = !existsSync(cursorFilePath);
+  let cursor: number | undefined = readCursor(cursorFilePath);
   const scanIntervalMs = config.scanIntervalMs;
   let ready = false;
   let tickInFlight = false;
-  const seenTxHashes = new Set<string>();
-  const seenQueue: string[] = [];
-  const briefStore = new InMemoryBriefStore();
-  cache.getSnapshot({ forceRefresh: false }).then(() => { ready = true; }).catch(() => {});
+
+  const persistDir = resolve(process.cwd(), config.persistStorePath);
+  const briefStore = (() => {
+    try {
+      if (!existsSync(persistDir)) mkdirSync(persistDir, { recursive: true });
+    } catch {}
+    return new FileBriefStore(resolve(persistDir, "briefs.json"));
+  })();
+
+  const seenPath = resolve(persistDir, "seen.json");
+  let loadedSeen: string[] = [];
+  try {
+    if (existsSync(seenPath)) {
+      const raw = readFileSync(seenPath, "utf8");
+      loadedSeen = JSON.parse(raw) as string[];
+    }
+  } catch {}
+  const seenSet = SeenSet.fromArray(Array.isArray(loadedSeen) ? loadedSeen : []);
+  log.info(`Loaded ${seenSet.size} seen hashes from ${seenPath}`);
+  const flushSeen = (): void => {
+    try {
+      writeFileSync(seenPath, JSON.stringify(seenSet.toArray()), "utf8");
+    } catch {}
+  };
+  const SEEN_SAVE_INTERVAL_MS = 60_000;
+  const seenSaveIntervalId = setInterval(flushSeen, SEEN_SAVE_INTERVAL_MS);
+
+  const senderPendingQueues = new SenderPendingQueues({
+    onDrop: (txHash) => seenSet.add(txHash),
+  });
+
+  // Proactive cache warmup — block until first load completes so the first
+  // real user request never pays cold-start latency.
+  // On first-ever run (no cursor file), fast-forward through all existing messages
+  // and mark them as seen without responding. This prevents replaying conversation
+  // history from before the bot was first started.
+  if (isFirstRun) {
+    log.info("First run detected — fast-forwarding past existing messages (no responses will be sent)…");
+    let ffCursor: number | undefined = undefined;
+    let ffPages = 0;
+    const MAX_FF_PAGES = 100;
+    while (ffPages < MAX_FF_PAGES) {
+      const ffParams: Record<string, unknown> = { limit: 50, direction: "inbound" };
+      if (ffCursor != null) ffParams.since_ledger = ffCursor;
+      try {
+        const scanText = await withRetry(() => mcp.callTool("scan_messages", ffParams));
+        const scan = parseScanResult(scanText);
+        const msgs = scan.messages ?? [];
+        for (const msg of msgs) {
+          if (msg.tx_hash) seenSet.add(msg.tx_hash);
+        }
+        if (scan.next_cursor != null) ffCursor = scan.next_cursor;
+        if (msgs.length < 50) break;
+        ffPages++;
+      } catch {
+        break;
+      }
+    }
+    if (ffCursor != null) {
+      cursor = ffCursor;
+      writeCursor(cursorFilePath, cursor);
+    }
+    flushSeen();
+    log.info(`Fast-forward complete: ${seenSet.size} messages skipped, cursor set to ${cursor ?? "unknown"}.`);
+  }
+
+  log.info("Warming member-index cache…");
+  try {
+    const warmT0 = Date.now();
+    await cache.getSnapshot({ forceRefresh: true });
+    log.info(`Cache warmed in ${Date.now() - warmT0}ms (${cache.stats.operator_count} operators).`);
+  } catch (err) {
+    log.error(`Cache warmup failed: ${(err as Error).message}`, "cache_warmup");
+  }
+  ready = true;
+
+  // Periodic background refresh keeps the cache hot between user requests.
+  const CACHE_REFRESH_INTERVAL_MS = Math.max(config.memberIndexTtlMs, 60_000);
+  const cacheRefreshId = setInterval(() => {
+    cache.getSnapshot({ forceRefresh: false }).catch((err) => {
+      log.error(`Periodic cache refresh failed: ${(err as Error).message}`, "cache_refresh");
+    });
+  }, CACHE_REFRESH_INTERVAL_MS);
+
+  // JWT health monitoring
+  const jwtExpiresAt = parseJwtExpiry(config.taskNodeJwt ?? null);
+  const jwtCheckId = setInterval(() => {
+    if (!jwtExpiresAt) return;
+    const remaining = jwtExpiresAt - Date.now();
+    if (remaining <= 0) {
+      log.error("JWT has EXPIRED. Matching requests will fail until a fresh token is set.", "jwt_expiry");
+    } else if (remaining < JWT_WARN_THRESHOLD_MS) {
+      log.warn(`JWT expires in ${Math.round(remaining / 60_000)} minutes. Refresh soon.`);
+    }
+  }, JWT_CHECK_INTERVAL_MS);
 
   const markSeen = (txHash: string): void => {
-    if (seenTxHashes.has(txHash)) return;
-    seenTxHashes.add(txHash);
-    seenQueue.push(txHash);
-    if (seenQueue.length > MAX_SEEN_TX_HASHES) {
-      const oldest = seenQueue.shift();
-      if (oldest) seenTxHashes.delete(oldest);
-    }
+    seenSet.add(txHash);
   };
+
+  const markReplied = (sender: string): void => {
+    lastReplyBySender.set(sender, Date.now());
+  };
+  const lastReplyBySender = new Map<string, number>();
 
   const tick = async (): Promise<void> => {
     if (tickInFlight) return;
     tickInFlight = true;
+    let nextCursorCandidate: number | undefined;
     try {
+      const toProcess: PendingMessage[] = [];
+      const sendersProcessedThisTick = new Set<string>();
+
+      for (const pm of senderPendingQueues.drainOnePerSender()) {
+        toProcess.push(pm);
+        sendersProcessedThisTick.add(pm.sender);
+      }
+
       const scanParams: Record<string, unknown> = { limit: 50, direction: "inbound" };
       if (cursor != null) scanParams.since_ledger = cursor;
 
       const scanText = await withRetry(() => mcp.callTool("scan_messages", scanParams));
       const scan = parseScanResult(scanText);
       if (scan.next_cursor != null) {
-        cursor = scan.next_cursor;
-        if (cursorFilePath) writeCursor(cursorFilePath, cursor);
+        nextCursorCandidate = scan.next_cursor;
       }
 
       const messages = scan.messages ?? [];
       for (const msg of messages) {
         if (msg.direction !== "inbound" || !msg.tx_hash || !msg.sender) continue;
-        if (seenTxHashes.has(msg.tx_hash)) continue;
+        if (seenSet.has(msg.tx_hash)) continue;
+        const getText = await withRetry(() => mcp.callTool("get_message", { tx_hash: msg.tx_hash }));
+        const get = parseGetMessageResult(getText);
+        const body = get.message ?? "";
+        if (sendersProcessedThisTick.has(msg.sender)) {
+          senderPendingQueues.enqueue(msg.sender, msg.tx_hash, body);
+        } else {
+          toProcess.push({ tx_hash: msg.tx_hash, sender: msg.sender, body });
+          sendersProcessedThisTick.add(msg.sender);
+        }
+      }
+
+      for (const pm of toProcess) {
         const requestId = generateRequestId();
         try {
-          const getText = await withRetry(() => mcp.callTool("get_message", { tx_hash: msg.tx_hash }));
-          const get = parseGetMessageResult(getText);
-          const body = get.message ?? "";
-          const existingBrief = briefStore.get(msg.sender);
+          const body = pm.body;
+          const existingBrief = briefStore.get(pm.sender);
           const hasActiveFollowup =
             Boolean(existingBrief) &&
             (existingBrief?.stage === "clarifying" || existingBrief?.stage === "ready");
           const request = parseRoutingRequest(body, hasActiveFollowup);
           if (!request) {
-            markSeen(msg.tx_hash);
+            markSeen(pm.tx_hash);
             continue;
           }
           if (request.action === "help") {
             await withRetry(() =>
               mcp.callTool("send_message", {
-                recipient: msg.sender,
+                recipient: pm.sender,
                 message: formatHelpReply(),
-                reply_to_tx: msg.tx_hash,
+                reply_to_tx: pm.tx_hash,
               })
             );
-            markSeen(msg.tx_hash);
+            markSeen(pm.tx_hash);
+            markReplied(pm.sender);
             continue;
           }
+
+          if (existingBrief?.stage === "ranked") {
+            let outcome: "selection" | "rerun" | "followup" | "unknown" = "unknown";
+            let selection: number | undefined;
+            const bodyTrim = pm.body.trim();
+            const bodyLower = bodyTrim.toLowerCase();
+            if (request.action === "match" && bodyLower.replace(/^\/match\s*/, "").trim().length > 5 && !/\brun now\b/.test(bodyLower)) {
+              outcome = "rerun";
+            } else if (/^\s*(?:match\s*)?[123]\s*$/i.test(bodyTrim) || /^\s*[123]\s*$/.test(bodyTrim)) {
+              const m = bodyTrim.match(/([123])/);
+              outcome = "selection";
+              selection = m ? parseInt(m[1], 10) : undefined;
+            } else if (request.action === "followup" || (request.action === "match" && bodyTrim.length > 0)) {
+              outcome = "followup";
+            }
+            log.matchOutcome(pm.sender, outcome, requestId, selection);
+          }
+
+          const isClarifyingFollowup =
+            request.action === "match" &&
+            existingBrief?.stage === "clarifying" &&
+            request.request_text.trim().length > 0;
 
           if (
             request.action === "match" &&
@@ -421,12 +544,13 @@ async function main(): Promise<void> {
               "Please provide one more detail to continue.";
             await withRetry(() =>
               mcp.callTool("send_message", {
-                recipient: msg.sender,
+                recipient: pm.sender,
                 message: formatPendingQuestionReminder(pendingPrompt),
-                reply_to_tx: msg.tx_hash,
+                reply_to_tx: pm.tx_hash,
               })
             );
-            markSeen(msg.tx_hash);
+            markSeen(pm.tx_hash);
+            markReplied(pm.sender);
             continue;
           }
 
@@ -434,14 +558,16 @@ async function main(): Promise<void> {
             request.action === "match"
               ? request.request_text
               : request.text;
-          const isFollowup = request.action === "followup";
+          const isFollowup = request.action === "followup" || isClarifyingFollowup;
           const isRunNow = isFollowup && /\brun now\b/i.test(userText);
           const briefForThisTurn =
-            request.action === "match"
-              ? null
-              : existingBrief;
+            isClarifyingFollowup
+              ? existingBrief
+              : request.action === "match"
+                ? null
+                : existingBrief;
 
-          if (request.action === "match") {
+          if (request.action === "match" && !isClarifyingFollowup) {
             briefStore.recordBriefStarted();
           }
           if (isFollowup && existingBrief?.stage === "clarifying") {
@@ -453,15 +579,15 @@ async function main(): Promise<void> {
           }
 
           const action = startOrContinueMatchBrief({
-            requester_wallet: msg.sender,
-            conversation_id: msg.sender,
+            requester_wallet: pm.sender,
+            conversation_id: pm.sender,
             text: userText,
             existing_brief: briefForThisTurn,
           });
 
           log.matchRequest({
             request_id: requestId,
-            sender: msg.sender,
+            sender: pm.sender,
             action: request.action as "match" | "followup" | "help",
             text_length: userText.length,
             brief_stage: action.brief.stage,
@@ -469,49 +595,51 @@ async function main(): Promise<void> {
           });
 
           if (action.type === "ask") {
-            briefStore.set(msg.sender, action.brief);
+            briefStore.set(pm.sender, action.brief);
             briefStore.recordQuestionAsked();
             log.clarification("clarification_asked", {
               request_id: requestId,
-              sender: msg.sender,
+              sender: pm.sender,
               question_id: action.question_id,
               questions_asked: action.brief.questions_asked,
               brief_confidence: action.brief.brief_confidence,
             });
             await withRetry(() =>
               mcp.callTool("send_message", {
-                recipient: msg.sender,
+                recipient: pm.sender,
                 message: formatClarifier(action.prompt),
-                reply_to_tx: msg.tx_hash,
+                reply_to_tx: pm.tx_hash,
               })
             );
-            markSeen(msg.tx_hash);
+            markSeen(pm.tx_hash);
+            markReplied(pm.sender);
             continue;
           }
 
           if (action.type === "close") {
-            briefStore.delete(msg.sender);
+            briefStore.delete(pm.sender);
             briefStore.recordClosed();
             log.briefLifecycle("brief_closed", {
               request_id: requestId,
-              sender: msg.sender,
+              sender: pm.sender,
               questions_answered: action.brief.questions_asked,
               brief_confidence: action.brief.brief_confidence,
             });
             await withRetry(() =>
               mcp.callTool("send_message", {
-                recipient: msg.sender,
+                recipient: pm.sender,
                 message: "Match request closed. Send /match when you want to start again.",
-                reply_to_tx: msg.tx_hash,
+                reply_to_tx: pm.tx_hash,
               })
             );
-            markSeen(msg.tx_hash);
+            markSeen(pm.tx_hash);
+            markReplied(pm.sender);
             continue;
           }
 
           if (action.type === "noop") {
-            briefStore.set(msg.sender, action.brief);
-            markSeen(msg.tx_hash);
+            briefStore.set(pm.sender, action.brief);
+            markSeen(pm.tx_hash);
             continue;
           }
 
@@ -524,21 +652,33 @@ async function main(): Promise<void> {
             {
               request_text: requestText || userText,
               tags: action.brief.must_have_skills.length > 0 ? action.brief.must_have_skills : action.brief.domain,
+              urgency: action.brief.urgency,
+              constraints:
+                action.brief.exclude_wallets?.length || action.brief.min_trust_score != null
+                  ? {
+                      exclude_operator_ids: action.brief.exclude_wallets?.length ? action.brief.exclude_wallets : undefined,
+                      min_alignment_score: action.brief.min_trust_score ?? undefined,
+                    }
+                  : undefined,
             },
             dataset
           );
           const matchLatency = Date.now() - matchT0;
 
           briefStore.recordRanked(action.provisional);
+          const matchTags = action.brief.must_have_skills.length > 0 ? action.brief.must_have_skills : action.brief.domain;
           log.matchResult({
             request_id: requestId,
-            sender: msg.sender,
+            sender: pm.sender,
             match_count: matchResult.top_matches.length,
             top_score: matchResult.top_matches[0]?.overall_match_score ?? 0,
             top_confidence: matchResult.top_matches[0]?.confidence ?? 0,
             provisional: action.provisional,
             latency_ms: matchLatency,
             cache_status: lastCacheStatus,
+            request_text_length: (requestText || userText).length,
+            tag_count: matchTags.length,
+            user_message_count: action.brief.user_messages.length,
           });
 
           const operatorMeta = new Map<string, { walletLabel?: string; summary?: string; capabilities?: string[] }>();
@@ -554,9 +694,9 @@ async function main(): Promise<void> {
           const reply = `${header}${formatTop3Reply(matchResult, operatorMeta)}`.trim();
           await withRetry(() =>
             mcp.callTool("send_message", {
-              recipient: msg.sender,
+              recipient: pm.sender,
               message: reply,
-              reply_to_tx: msg.tx_hash,
+              reply_to_tx: pm.tx_hash,
             })
           );
           const rankedCandidates: RankedCandidate[] = matchResult.top_matches.map((m) => ({
@@ -571,33 +711,43 @@ async function main(): Promise<void> {
             open_chat_link: buildTaskNodeChatLink(m.wallet_address ?? m.operator_id ?? ""),
           }));
           const finalized = finalizeRankedBrief(action.brief, rankedCandidates, action.provisional);
-          briefStore.set(msg.sender, finalized);
-          markSeen(msg.tx_hash);
+          briefStore.set(pm.sender, finalized);
+          markSeen(pm.tx_hash);
+          markReplied(pm.sender);
           log.briefLifecycle("brief_ranked", {
             request_id: requestId,
-            sender: msg.sender,
+            sender: pm.sender,
             questions_answered: action.brief.questions_asked,
             brief_confidence: action.brief.brief_confidence,
           });
         } catch (err) {
           const errMsg = redactSecrets((err as Error).message);
-          log.error(errMsg, `message ${msg.tx_hash}`, requestId);
+          log.error(errMsg, `message ${pm.tx_hash}`, requestId);
           try {
             await withRetry(() =>
               mcp.callTool("send_message", {
-                recipient: msg.sender,
+                recipient: pm.sender,
                 message: formatHelpReply(),
-                reply_to_tx: msg.tx_hash,
+                reply_to_tx: pm.tx_hash,
               })
             );
-            markSeen(msg.tx_hash);
+            markSeen(pm.tx_hash);
           } catch (sendErr) {
             log.error(redactSecrets((sendErr as Error).message), "fallback_help_reply", requestId);
           }
         }
       }
+
+      // Persist cursor only after message processing completes (at-least-once semantics).
+      if (nextCursorCandidate != null) {
+        cursor = nextCursorCandidate;
+        const ok = writeCursor(cursorFilePath, cursor);
+        if (!ok) log.warn("Cursor file write failed; next tick will replay from previous cursor.");
+        log.cursorCommit(ok, cursor, ok ? undefined : "write failed");
+      }
     } catch (err) {
       log.error(redactSecrets((err as Error).message), "scan_tick");
+      log.cursorCommit(false, nextCursorCandidate, (err as Error).message);
     } finally {
       tickInFlight = false;
     }
@@ -617,8 +767,18 @@ async function main(): Promise<void> {
         return;
       }
       if (url === "/stats") {
+        const now = Date.now();
+        const jwtStatus = !jwtExpiresAt
+          ? { status: "unknown" as const, expires_at: null, expires_in_ms: null }
+          : jwtExpiresAt <= now
+            ? { status: "expired" as const, expires_at: new Date(jwtExpiresAt).toISOString(), expires_in_ms: jwtExpiresAt - now }
+            : jwtExpiresAt - now < JWT_WARN_THRESHOLD_MS
+              ? { status: "expiring_soon" as const, expires_at: new Date(jwtExpiresAt).toISOString(), expires_in_ms: jwtExpiresAt - now }
+              : { status: "ok" as const, expires_at: new Date(jwtExpiresAt).toISOString(), expires_in_ms: jwtExpiresAt - now };
+
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
+          jwt: jwtStatus,
           cache: cache.stats,
           funnel: briefStore.funnel,
           active_briefs: briefStore.size,
@@ -643,9 +803,14 @@ async function main(): Promise<void> {
   const shutdown = (): void => {
     clearInterval(intervalId);
     clearInterval(sweepIntervalId);
+    clearInterval(cacheRefreshId);
+    clearInterval(jwtCheckId);
+    clearInterval(seenSaveIntervalId);
+    // Flush seenSet to disk so restarts don't replay already-processed messages.
+    flushSeen();
     mcp.disconnect();
     try {
-      unlinkSync(lockFilePath);
+      unlinkSync(BOT_LOCK_FILE);
     } catch {}
     process.exit(0);
   };

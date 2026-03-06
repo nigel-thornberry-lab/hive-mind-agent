@@ -1,5 +1,6 @@
 import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
+import { homedir } from "node:os";
 
 export interface BotConfig {
   /** Path to file containing bot wallet seed (recommended). Prefer over BOT_SEED. */
@@ -22,8 +23,10 @@ export interface BotConfig {
   memberIndexLimit: number;
   /** Poll interval for scan_messages in ms. */
   scanIntervalMs: number;
-  /** Optional path to persist idempotency cursor (since_ledger). */
-  cursorFilePath: string | null;
+  /** Path to persist idempotency cursor (since_ledger). Defaults to ~/.hivemind-bot-cursor. */
+  cursorFilePath: string;
+  /** Directory for persistent brief + seen-hash store. Defaults to ~/.hivemind-bot-store. */
+  persistStorePath: string;
   /** Optional health server port (0 = disabled). */
   healthPort: number;
 }
@@ -73,7 +76,10 @@ export function loadConfig(): BotConfig {
     memberIndexTtlMs: envNumber("PFT_MEMBER_INDEX_TTL_MS", 300_000),
     memberIndexLimit: Math.max(1, Math.min(200, envNumber("PFT_MEMBER_INDEX_LIMIT", 40))),
     scanIntervalMs: Math.max(5_000, envNumber("PFT_SCAN_INTERVAL_MS", 30_000)),
-    cursorFilePath: env("PFT_BOT_CURSOR_FILE")?.trim() || null,
+    // Default to absolute home-dir paths so cursor + seenSet survive restarts
+    // regardless of the working directory the bot is launched from.
+    cursorFilePath: env("PFT_BOT_CURSOR_FILE")?.trim() || join(homedir(), ".hivemind-bot-cursor"),
+    persistStorePath: env("PFT_BOT_PERSIST_STORE_PATH")?.trim() || join(homedir(), ".hivemind-bot-store"),
     healthPort: Math.max(0, envNumber("PFT_BOT_HEALTH_PORT", 0)),
   };
 }

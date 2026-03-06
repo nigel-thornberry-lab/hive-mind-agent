@@ -7,7 +7,13 @@ import assert from "node:assert";
 import { Logger, generateRequestId } from "../src/logger.js";
 import { MemberIndexCache, type CacheStats } from "../src/member-index-cache.js";
 import { InMemoryBriefStore } from "../src/conversation-state-machine.js";
-import { createMatchBrief, markReady, attachRankedResult } from "../src/match-brief.js";
+import {
+  createMatchBrief,
+  markReady,
+  attachRankedResult,
+  applyUserMessage,
+  computeBriefConfidence,
+} from "../src/match-brief.js";
 import type { BotConfig } from "../src/config.js";
 
 function minimalConfig(overrides: Partial<BotConfig> = {}): BotConfig {
@@ -22,7 +28,8 @@ function minimalConfig(overrides: Partial<BotConfig> = {}): BotConfig {
     memberIndexTtlMs: 100,
     memberIndexLimit: 10,
     scanIntervalMs: 5000,
-    cursorFilePath: null,
+    cursorFilePath: "/tmp/test-cursor",
+    persistStorePath: "/tmp/test-store",
     healthPort: 0,
     ...overrides,
   };
@@ -327,5 +334,76 @@ describe("InMemoryBriefStore funnel counters", () => {
         resolve();
       }, 10);
     });
+  });
+});
+
+// ─── brief_confidence interaction bonus ────────────────────────────────────────
+
+describe("computeBriefConfidence interaction bonus", () => {
+  it("initial brief with no skill keywords has only objective weight (0.3)", () => {
+    const brief = createMatchBrief({
+      requester_wallet: "rTest",
+      conversation_id: "c-conf",
+      initial_text: "find me an expert",
+    });
+    assert.strictEqual(brief.brief_confidence, 0.3);
+  });
+
+  it("answering one question adds 0.1 interaction bonus", () => {
+    let brief = createMatchBrief({
+      requester_wallet: "rTest",
+      conversation_id: "c-conf",
+      initial_text: "find me an expert",
+    });
+    assert.strictEqual(brief.brief_confidence, 0.3);
+
+    brief = applyUserMessage(brief, { message: "someone reliable" });
+    // "reliable" sets alignment_preference="proven" (0.20) + interaction(0.1)
+    // objective(0.3) + alignment(0.20) + interaction(0.1) = 0.6
+    assert.strictEqual(brief.brief_confidence, 0.6);
+    assert.strictEqual(brief.user_messages.length, 2);
+  });
+
+  it("answering two questions caps interaction bonus at 0.15", () => {
+    let brief = createMatchBrief({
+      requester_wallet: "rTest",
+      conversation_id: "c-conf",
+      initial_text: "find me an expert",
+    });
+
+    brief = applyUserMessage(brief, { message: "someone reliable" });
+    brief = applyUserMessage(brief, { message: "good communication matters" });
+    // "reliable" sets alignment_preference="proven" (0.20)
+    // objective(0.3) + alignment(0.20) + interaction(min(0.15, 2*0.1)=0.15) = 0.65
+    assert.strictEqual(brief.brief_confidence, 0.65);
+    assert.strictEqual(brief.user_messages.length, 3);
+  });
+
+  it("interaction bonus stacks with field-based scoring", () => {
+    let brief = createMatchBrief({
+      requester_wallet: "rTest",
+      conversation_id: "c-conf",
+      initial_text: "find me an expert",
+    });
+    assert.strictEqual(brief.brief_confidence, 0.3);
+
+    brief = applyUserMessage(brief, { message: "must know typescript" });
+    // objective(0.3) + mustHave(0.20) + interaction(0.1) = 0.6
+    assert.strictEqual(brief.brief_confidence, 0.6);
+
+    brief = applyUserMessage(brief, { message: "this week" });
+    // objective(0.3) + mustHave(0.20) + timeline(0.15) + interaction(0.15) = 0.8
+    assert.strictEqual(brief.brief_confidence, 0.8);
+  });
+
+  it("passes 0.3 threshold after single answer even without keyword match", () => {
+    let brief = createMatchBrief({
+      requester_wallet: "rTest",
+      conversation_id: "c-conf",
+      initial_text: "find me an expert",
+    });
+
+    brief = applyUserMessage(brief, { message: "yes" });
+    assert.ok(brief.brief_confidence > 0.3, `expected > 0.3 but got ${brief.brief_confidence}`);
   });
 });

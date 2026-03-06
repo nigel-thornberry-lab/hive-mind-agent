@@ -10,7 +10,12 @@ import {
   type MatchBrief,
   type RankedCandidate,
 } from "./match-brief.js";
-import { chooseNextQuestion } from "./question-policy.js";
+import {
+  chooseNextQuestion,
+  getFirstQuestionSituation,
+  getSecondQuestionHardThing,
+  getThirdQuestionTrustLevel,
+} from "./question-policy.js";
 
 export type ConversationAction =
   | { type: "ask"; question_id: string; prompt: string; brief: MatchBrief }
@@ -48,19 +53,43 @@ export function startOrContinueMatchBrief(input: StateMachineInput): Conversatio
   }
 
   brief = recomputeDerived(brief);
-  // Require at least one clarifying question unless user explicitly forces ranking.
+
+  // Q1 (mandatory): situation — context-first narrative framing.
   if (!forceRun && brief.questions_asked === 0) {
-    const q0 = chooseNextQuestion(brief);
-    if (q0) {
-      const asked0 = markQuestionAsked(brief, q0.id);
-      return {
-        type: "ask",
-        question_id: q0.id,
-        prompt: q0.prompt,
-        brief: asked0,
-      };
-    }
+    const q0 = getFirstQuestionSituation(brief);
+    const asked0 = markQuestionAsked(brief, q0.id);
+    return {
+      type: "ask",
+      question_id: q0.id,
+      prompt: q0.prompt,
+      brief: asked0,
+    };
   }
+
+  // Q2 (mandatory): hardest part — surfaces primary skill, forces prioritization.
+  if (!forceRun && brief.questions_asked === 1 && !brief.asked_question_ids.includes("q_hard_thing")) {
+    const q1 = getSecondQuestionHardThing(brief);
+    const asked1 = markQuestionAsked(brief, q1.id);
+    return {
+      type: "ask",
+      question_id: q1.id,
+      prompt: q1.prompt,
+      brief: asked1,
+    };
+  }
+
+  // Q3 (mandatory): trust level — unlocks alignment_preference (15% of match score).
+  if (!forceRun && brief.questions_asked === 2 && !brief.asked_question_ids.includes("q_trust_level")) {
+    const q2 = getThirdQuestionTrustLevel(brief);
+    const asked2 = markQuestionAsked(brief, q2.id);
+    return {
+      type: "ask",
+      question_id: q2.id,
+      prompt: q2.prompt,
+      brief: asked2,
+    };
+  }
+
   if (shouldStopClarifying(brief, forceRun)) {
     return { type: "rank", provisional: brief.brief_confidence < 0.75, brief: markReady(brief) };
   }
