@@ -16,13 +16,13 @@ const MCP_SCRIPT = "dist/src/mcp-server-with-routing.js";
 const REGISTER_PARAMS = {
   name: "Hive Mind Routing",
   description:
-    "Need something done fast? Leverage the Post Fiat Hive Mind. Tell me what you need, and I'll return the top 3 members most likely to deliver - with confidence, trust context, and why they fit.",
+    "Describe what you need and I'll match you with the top 3 network members best equipped to deliver it. I ask 3 quick questions — what's the situation, what's the hardest part, and how much track record you need — then rank by skill fit, alignment, and trust signals.",
   capabilities: ["routing", "member-matching", "text-generation"],
   commands: [
     {
       command: "/match",
-      example: "/match I need help creating an NFT collection on chain",
-      description: "Return top 3 ranked member matches with confidence and reasoning.",
+      example: "/match I need to audit my Solidity contracts before mainnet",
+      description: "Return top 3 ranked member matches with confidence scores and reasoning.",
       min_cost_drops: "5000000",
     },
   ],
