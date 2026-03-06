@@ -358,7 +358,9 @@ describe("computeBriefConfidence interaction bonus", () => {
     assert.strictEqual(brief.brief_confidence, 0.3);
 
     brief = applyUserMessage(brief, { message: "someone reliable" });
-    assert.strictEqual(brief.brief_confidence, 0.4);
+    // "reliable" sets alignment_preference="proven" (0.20) + interaction(0.1)
+    // objective(0.3) + alignment(0.20) + interaction(0.1) = 0.6
+    assert.strictEqual(brief.brief_confidence, 0.6);
     assert.strictEqual(brief.user_messages.length, 2);
   });
 
@@ -371,8 +373,9 @@ describe("computeBriefConfidence interaction bonus", () => {
 
     brief = applyUserMessage(brief, { message: "someone reliable" });
     brief = applyUserMessage(brief, { message: "good communication matters" });
-    // objective(0.3) + interaction(min(0.15, 2*0.1)=0.15) = 0.45
-    assert.strictEqual(brief.brief_confidence, 0.45);
+    // "reliable" sets alignment_preference="proven" (0.20)
+    // objective(0.3) + alignment(0.20) + interaction(min(0.15, 2*0.1)=0.15) = 0.65
+    assert.strictEqual(brief.brief_confidence, 0.65);
     assert.strictEqual(brief.user_messages.length, 3);
   });
 
@@ -385,12 +388,12 @@ describe("computeBriefConfidence interaction bonus", () => {
     assert.strictEqual(brief.brief_confidence, 0.3);
 
     brief = applyUserMessage(brief, { message: "must know typescript" });
-    // objective(0.3) + mustHave(0.25) + interaction(0.1) = 0.65
-    assert.strictEqual(brief.brief_confidence, 0.65);
+    // objective(0.3) + mustHave(0.20) + interaction(0.1) = 0.6
+    assert.strictEqual(brief.brief_confidence, 0.6);
 
     brief = applyUserMessage(brief, { message: "this week" });
-    // objective(0.3) + mustHave(0.25) + timeline(0.2) + interaction(0.15) = 0.9
-    assert.strictEqual(brief.brief_confidence, 0.9);
+    // objective(0.3) + mustHave(0.20) + timeline(0.15) + interaction(0.15) = 0.8
+    assert.strictEqual(brief.brief_confidence, 0.8);
   });
 
   it("passes 0.3 threshold after single answer even without keyword match", () => {

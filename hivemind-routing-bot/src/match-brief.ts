@@ -8,9 +8,12 @@ export type BudgetBand = "lt_1k" | "1k_5k" | "5k_20k" | "20k_plus" | "unknown";
 export type MissingField =
   | "objective_or_deliverable"
   | "must_have_skills"
+  | "alignment_preference"
   | "timeline_or_urgency"
   | "budget"
   | "constraints";
+
+export type AlignmentPreference = "proven" | "preferred" | "open";
 
 export interface RankedCandidate {
   rank: number;
@@ -43,6 +46,7 @@ export interface MatchBrief {
   timeline_due_at: string | null;
   budget_band: BudgetBand;
   budget_pft: number | null;
+  alignment_preference: AlignmentPreference | null;
   timezone_pref: string | null;
   min_trust_score: number | null;
   exclude_wallets: string[];
@@ -83,6 +87,15 @@ function normalizeLowerWords(text: string): string[] {
     .split(/\s+/)
     .map((w) => w.trim())
     .filter((w) => w.length > 1);
+}
+
+function detectAlignmentPreference(text: string): AlignmentPreference | null {
+  const t = text.toLowerCase();
+  // Check "preferred" before "proven" — "track record" belongs to preferred, not proven
+  if (/\bpreferred?\b|\bgood track\b|\bsome experience\b|\btrack record\b/.test(t)) return "preferred";
+  if (/\bproven\b|\bestablished\b|\breliable\b|\bveteran\b|\bsenior\b|\bexperienced\b/.test(t)) return "proven";
+  if (/\bopen\b|\beither\b|\bboth\b|\bnewer\b|\bhungry\b|\bdoesn.t matter\b|\bany\b/.test(t)) return "open";
+  return null;
 }
 
 function detectUrgency(text: string): Urgency {
@@ -149,22 +162,25 @@ export function computeMissingFields(brief: MatchBrief): MissingField[] {
   const missing: MissingField[] = [];
   if (!brief.objective && !brief.deliverable) missing.push("objective_or_deliverable");
   if (brief.must_have_skills.length === 0 && brief.domain.length === 0) missing.push("must_have_skills");
+  if (!brief.alignment_preference) missing.push("alignment_preference");
   if (!brief.timeline_due_at && brief.urgency === "unknown") missing.push("timeline_or_urgency");
   if (brief.budget_pft == null && brief.budget_band === "unknown") missing.push("budget");
-  if (!brief.timezone_pref && brief.min_trust_score == null) missing.push("constraints");
+  if (!brief.timezone_pref) missing.push("constraints");
   return missing;
 }
 
 export function computeBriefConfidence(brief: MatchBrief): number {
   const objective = brief.objective || brief.deliverable ? 1 : 0;
   const mustHave = brief.must_have_skills.length > 0 || brief.domain.length > 0 ? 1 : 0;
+  const alignmentPref = brief.alignment_preference !== null ? 1 : 0;
   const timeline = brief.timeline_due_at || brief.urgency !== "unknown" ? 1 : 0;
   const budget = brief.budget_pft != null || brief.budget_band !== "unknown" ? 1 : 0;
-  const constraints = brief.timezone_pref || brief.min_trust_score != null ? 1 : 0;
+  const constraints = brief.timezone_pref ? 1 : 0;
 
   const fieldScore =
     INTAKE_IMPACT_WEIGHTS.objective_or_deliverable * objective +
     INTAKE_IMPACT_WEIGHTS.must_have_skills * mustHave +
+    INTAKE_IMPACT_WEIGHTS.alignment_preference * alignmentPref +
     INTAKE_IMPACT_WEIGHTS.timeline_or_urgency * timeline +
     INTAKE_IMPACT_WEIGHTS.budget * budget +
     INTAKE_IMPACT_WEIGHTS.constraints * constraints;
@@ -224,6 +240,7 @@ export function createMatchBrief(input: CreateMatchBriefInput): MatchBrief {
     timeline_due_at: null,
     budget_band: detectBudgetBand(text),
     budget_pft: null,
+    alignment_preference: null,
     timezone_pref: null,
     min_trust_score: null,
     exclude_wallets: [],
@@ -276,6 +293,14 @@ export function applyUserMessage(brief: MatchBrief, options: ApplyUserMessageOpt
 
   if (next.urgency === "unknown") next.urgency = detectUrgency(lower);
   if (next.budget_band === "unknown") next.budget_band = detectBudgetBand(lower);
+  if (!next.alignment_preference) {
+    const pref = detectAlignmentPreference(text);
+    if (pref) {
+      next.alignment_preference = pref;
+      if (pref === "proven") next.min_trust_score = 70;
+      else if (pref === "preferred") next.min_trust_score = 40;
+    }
+  }
 
   const budgetMatch = lower.match(/(\d{2,6})\s*pft/);
   if (budgetMatch) {
@@ -293,7 +318,8 @@ export function shouldStopClarifying(brief: MatchBrief, force = false): boolean 
   const hardReady =
     (brief.objective || brief.deliverable) &&
     (brief.must_have_skills.length > 0 || brief.domain.length > 0) &&
-    (brief.timeline_due_at || brief.urgency !== "unknown");
+    (brief.timeline_due_at || brief.urgency !== "unknown") &&
+    brief.alignment_preference !== null;
   return Boolean(hardReady);
 }
 
@@ -331,6 +357,33 @@ export function attachRankedResult(
     },
     updated_at: new Date().toISOString(),
   };
+}
+
+/**
+ * Assemble the full request text sent to the matching engine.
+ * Includes structured fields AND raw user messages so that domain jargon,
+ * tool names, and problem descriptions that keyword extractors miss still
+ * reach the tokenizer and embedding scorer.
+ */
+export function buildMatchRequestText(brief: MatchBrief): string {
+  const structured = [
+    brief.objective ?? "",
+    brief.deliverable ? `Deliverable: ${brief.deliverable}` : "",
+    brief.must_have_skills.length ? `Must-have: ${brief.must_have_skills.join(", ")}` : "",
+    brief.nice_to_have_skills.length ? `Nice-to-have: ${brief.nice_to_have_skills.join(", ")}` : "",
+    brief.alignment_preference ? `Alignment preference: ${brief.alignment_preference}` : "",
+    brief.min_trust_score != null ? `Min alignment score: ${brief.min_trust_score}` : "",
+    brief.urgency !== "unknown" ? `Urgency: ${brief.urgency}` : "",
+    brief.budget_pft != null ? `Budget: ${brief.budget_pft} PFT` : "",
+    brief.budget_band !== "unknown" ? `Budget band: ${brief.budget_band}` : "",
+  ].filter(Boolean);
+
+  const rawAnswers = brief.user_messages
+    .slice(1)
+    .map((m) => m.text)
+    .filter((t) => t.length > 0);
+
+  return [...structured, ...rawAnswers].join("\n").trim();
 }
 
 export function closeBrief(brief: MatchBrief, note?: string): MatchBrief {
